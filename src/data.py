@@ -1,13 +1,11 @@
-import os
-import random
-from typing import Dict, List, Optional
-
+from typing import Dict, List, Optional, Union
 import numpy as np
-import pandas as pd
+import anndata as ad
 import pytorch_lightning as pl
 import scanpy as sc
-from scipy.sparse import csc_matrix, csr_matrix
+import scipy as sp
 import torch
+import pandas as pd
 from torch.utils.data import DataLoader, IterableDataset
 
 from src.dataclasses import SparseExpressionData
@@ -18,58 +16,146 @@ class CrossSpeciesDataset(IterableDataset):
 
     def __init__(
         self,
-        files_list: List[str],
-        species_map: Dict[str, int],
-        gene_vocab: Dict[str, int],
-        data_dir: str = None,
-        max_steps: int = 5000,
+        species_data: Dict[str, ad.AnnData],
         batch_size: int = 128,
-        gene_col_name: str = "feature_id",
-        filter_to_vocab: bool = True,
-        filter_outliers: float = 0.0,
-        min_expressed_genes: int = 200,
         seed: int = 0,
-        normalize_to_scale: bool = None,
-        clip_counts: float = 1e10,
-        log_norm_counts: bool = False,
     ):
         """
         Initialize dataset.
 
         Args:
-            files_list: List of AnnData file paths
-            species_map: Mapping from species names to indices
-            gene_vocab: Mapping from gene names to indices
-            data_dir: Base directory for data files
-            max_steps: Maximum number of steps per epoch
-            batch_size: Batch size
-            gene_col_name: Column name for gene IDs
-            filter_to_vocab: Whether to filter genes to vocabulary
-            filter_outliers: Standard deviation threshold for outlier filtering
-            min_expressed_genes: Minimum number of expressed genes per cell
-            seed: Random seed
-            normalize_to_scale: Whether to normalize counts to a specific scale
-            clip_counts: Maximum value for count clipping
-            log_norm_counts: Whether to apply log normalization
+            species_data: Dictionary mapping species names to preprocessed AnnData objects
+            batch_size: Number of cells per batch (per species)
+            seed: Random seed for reproducibility
         """
         super().__init__()
-        self.files_list = files_list
-        self.species_map = species_map
-        self.gene_vocab = gene_vocab
-        self.data_dir = data_dir
-        self.max_steps = max_steps
         self.batch_size = batch_size
-        self.gene_col_name = gene_col_name
-        self.filter_to_vocab = filter_to_vocab
-        self.filter_outliers = filter_outliers
-        self.min_expressed_genes = min_expressed_genes
         self.seed = seed
-        self.normalize_to_scale = normalize_to_scale
-        self.clip_counts = clip_counts
-        self.log_norm_counts = log_norm_counts
-
+        
+        # Store species names and create concatenated data
+        self.species_names = list(species_data.keys())
+        self.concatenated_data = self._concatenate_species_data(species_data)
+        
+        # Create species indices
+        self.species_to_idx = {name: idx for idx, name in enumerate(self.species_names)}
+        self.species_indices = {
+            species: np.where(self.concatenated_data.obs["species"] == species)[0]
+            for species in self.species_names
+        }
+        
+        # Calculate sampling statistics
+        self.n_cells_per_species = {
+            species: len(indices) for species, indices in self.species_indices.items()
+        }
+        self.max_cells = max(self.n_cells_per_species.values())
+        
+        # Initialize sampling state
+        self.rng = np.random.RandomState(seed)
+        self._init_sampling_state()
+        
         self.worker_id = None
         self.num_workers = None
+
+    def _concatenate_species_data(self, species_data):
+        """Concatenate data from different species in a block-diagonal fashion."""
+        species_list = list(species_data.values())
+        
+        # Block concatenate of X data across species
+        block_diag_X = sp.sparse.block_diag([data.X for data in species_list], format="csr")
+        concat_obs = pd.concat([data.obs for data in species_list])
+        concat_var = pd.concat([data.var for data in species_list])
+        var_names = pd.concat([data.var_names for data in species_list])
+        var_names = pd.Index(var_names)
+        concat_var.index = var_names
+        obs_names = pd.concat([data.obs_names for data in species_list])
+        obs_names = pd.Index(obs_names)
+        concat_obs.index = obs_names
+
+        uns = {}
+        for data in species_list:
+            uns.update(data.uns)
+
+        concat_adata = ad.AnnData(
+            X=block_diag_X,
+            obs=concat_obs,
+            var=concat_var,
+            uns=uns
+        )
+        return concat_adata
+
+    def _init_sampling_state(self):
+        """Initialize sampling state for each species."""
+        self.available_indices = {
+            species: indices.copy() 
+            for species, indices in self.species_indices.items()
+        }
+        self.seen_largest_dataset = set()
+        
+        # Find species with max cells for epoch tracking
+        self.largest_species = max(
+            self.n_cells_per_species.items(), 
+            key=lambda x: x[1]
+        )[0]
+
+    def _get_batch_indices(self):
+        """Get balanced batch of indices across species."""
+        batch_indices = []
+        cells_per_species = self.batch_size // len(self.species_names)
+        
+        for species in self.species_names:
+            available = self.available_indices[species]
+            
+            if len(available) >= cells_per_species:
+                # Sample without replacement
+                selected_idx = self.rng.choice(
+                    available, 
+                    cells_per_species, 
+                    replace=False
+                )
+                self.available_indices[species] = np.setdiff1d(
+                    available, 
+                    selected_idx
+                )
+            else:
+                # Sample with replacement from original indices
+                selected_idx = self.rng.choice(
+                    self.species_indices[species], 
+                    cells_per_species, 
+                    replace=True
+                )
+            
+            batch_indices.extend(selected_idx)
+            
+            # Track cells seen from largest dataset
+            if species == self.largest_species:
+                self.seen_largest_dataset.update(selected_idx)
+        
+        return np.array(batch_indices)
+
+    def _epoch_finished(self):
+        """Check if we've seen all cells from the largest dataset."""
+        return len(self.seen_largest_dataset) >= self.n_cells_per_species[self.largest_species]
+
+    def _create_sparse_batch(self, indices):
+        """Create a SparseExpressionData batch from indices."""
+        batch_data = self.concatenated_data[indices]
+        
+        values = torch.from_numpy(batch_data.X.data.astype(np.float32))
+        gene_idx = torch.from_numpy(batch_data.X.indices.astype(np.int64))
+        batch_idx = torch.from_numpy(batch_data.X.indptr.astype(np.int64))
+        species_idx = torch.tensor(
+            [self.species_to_idx[s] for s in batch_data.obs["species"]],
+            dtype=torch.int64
+        )
+        
+        return SparseExpressionData(
+            values=values,
+            batch_idx=batch_idx,
+            gene_idx=gene_idx,
+            species_idx=species_idx,
+            batch_size=len(indices),
+            n_genes=len(self.concatenated_data.var_names)
+        )
 
     def _initialize_worker_info(self):
         """Initialize worker information for distributed training."""
@@ -78,126 +164,14 @@ class CrossSpeciesDataset(IterableDataset):
             self.worker_id = worker_info.id
             self.num_workers = worker_info.num_workers
 
-            # Divide files among workers
-            per_worker = int(np.ceil(len(self.files_list) / float(self.num_workers)))
-            start_idx = self.worker_id * per_worker
-            end_idx = min(start_idx + per_worker, len(self.files_list))
-            self.files_list = self.files_list[start_idx:end_idx]
-
-    def _get_batch_from_file(self, file_path: str) -> Optional[SparseExpressionData]:
-        """Get a batch of data from a file."""
-        file_path = (
-            os.path.join(self.data_dir, file_path) if self.data_dir else file_path
-        )
-
-        # Load data
-        try:
-            adata = sc.read_h5ad(file_path)
-        except Exception as e:
-            print(f"Failed to read file {file_path}: {e}")
-            return None
-
-        # Get gene names
-        try:
-            var_file = os.path.join(os.path.dirname(file_path), "var.csv")
-            if os.path.exists(var_file):
-                gene_names = pd.read_csv(var_file)[self.gene_col_name].values
-            else:
-                gene_names = adata.var[self.gene_col_name].values
-        except:
-            print(f"Failed to get gene names from {file_path}")
-            return None
-
-        # Convert to dense if sparse
-        X = (
-            adata.X.toarray()
-            if isinstance(adata.X, (csr_matrix, csc_matrix))
-            else np.array(adata.X)
-        )
-        if "free_annotation_v1" in adata.obs.columns:
-            adata.obs["species"] = "Microcebus murinus"
-        elif "organism" in adata.obs.columns:
-            adata.obs["species"] = adata.obs["organism"]
-        else:
-            adata.obs["species"] = "Danio rerio"
-        # Get species info
-        species = adata.obs["species"].iloc[
-            0
-        ]  # All cells in a file are from same species
-        species_idx = self.species_map[species]
-
-        # Filter and normalize
-        if self.filter_outliers > 0:
-            gene_means = np.mean(X, axis=0)
-            gene_stds = np.std(X, axis=0)
-            outlier_mask = np.abs(X - gene_means) < self.filter_outliers * gene_stds
-            X = X * outlier_mask
-
-        if self.normalize_to_scale:
-            sc.pp.normalize_total(adata, target_sum=1e4)
-
-        if self.log_norm_counts:
-            sc.pp.log1p(adata)
-
-        if self.clip_counts < float("inf"):
-            X = np.clip(X, 0, self.clip_counts)
-
-        # Sample cells for batch
-        n_cells = X.shape[0]
-        batch_size = min(self.batch_size, n_cells)
-        cell_indices = np.random.choice(n_cells, batch_size, replace=False)
-        X_batch = X[cell_indices]
-
-        # Convert to sparse format
-        nonzero_mask = X_batch > 0
-        values = []
-        batch_idx = []
-        gene_idx = []
-
-        for i in range(batch_size):
-            nonzero_genes = np.nonzero(nonzero_mask[i])[0]
-            if len(nonzero_genes) >= self.min_expressed_genes:
-                values.extend(X_batch[i, nonzero_genes])
-                batch_idx.extend([i] * len(nonzero_genes))
-                gene_idx.extend(
-                    [self.gene_vocab.get(g, 0) for g in gene_names[nonzero_genes]]
-                )
-
-        if not values:  # No valid cells found
-            return None
-
-        # Convert to tensors
-        return SparseExpressionData(
-            values=torch.FloatTensor(values),
-            batch_idx=torch.LongTensor(batch_idx),
-            gene_idx=torch.LongTensor(gene_idx),
-            species_idx=torch.LongTensor([species_idx] * batch_size),
-            batch_size=batch_size,
-            n_genes=len(self.gene_vocab),
-        )
-
     def __iter__(self):
-        """Iterator for the dataset."""
-        # Initialize worker info if not already done
-        if self.worker_id is None:
-            self._initialize_worker_info()
-
-        # Set random seed for reproducibility
-        random.seed(
-            self.seed + self.worker_id if self.worker_id is not None else self.seed
-        )
-
-        # Main iteration loop
-        step = 0
-        while step < self.max_steps:
-            # Randomly select a file
-            file_path = random.choice(self.files_list)
-
-            # Get batch from file
-            batch = self._get_batch_from_file(file_path)
-            if batch is not None:
-                yield batch
-                step += 1
+        """Iterate over batches of data."""
+        self._initialize_worker_info()
+        self._init_sampling_state()
+        
+        while not self._epoch_finished():
+            indices = self._get_batch_indices()
+            yield self._create_sparse_batch(indices)
 
 
 class CrossSpeciesDataModule(pl.LightningDataModule):
@@ -205,142 +179,146 @@ class CrossSpeciesDataModule(pl.LightningDataModule):
 
     def __init__(
         self,
-        train_files: List[str],
-        val_files: Optional[List[str]] = None,
-        test_files: Optional[List[str]] = None,
-        data_dir: Optional[str] = None,
-        gene_vocab: Optional[Dict[str, int]] = None,
+        species_data: Dict[str, Union[str, List[str], ad.AnnData, List[ad.AnnData]]],
         batch_size: int = 128,
         num_workers: int = 4,
-        max_steps_per_epoch: int = 5000,
-        gene_col_name: str = "feature_id",
-        filter_to_vocab: bool = True,
-        filter_outliers: float = 0.0,
-        min_expressed_genes: int = 200,
+        val_split: float = 0.1,
+        test_split: float = 0.1,
         seed: int = 0,
-        normalize_to_scale: bool = None,
-        clip_counts: float = 1e10,
-        log_norm_counts: bool = False,
-        species_map: Optional[Dict[str, int]] = None,
     ):
         """
         Initialize data module.
 
         Args:
-            train_files: Training data files
-            val_files: Validation data files (optional)
-            test_files: Test data files (optional)
-            data_dir: Base directory for data files
-            gene_vocab: Optional pre-defined gene vocabulary
+            species_data: Dictionary mapping species to data, where data can be:
+                - A single AnnData object
+                - A single file path (string) to h5ad file
+                - List of AnnData objects
+                - List of file paths to h5ad files
             batch_size: Batch size for dataloaders
             num_workers: Number of workers for dataloaders
-            max_steps_per_epoch: Maximum steps per epoch
+            val_split: Fraction of data to use for validation
+            test_split: Fraction of data to use for testing
+            seed: Random seed for reproducibility
         """
         super().__init__()
-        self.train_files = train_files
-        self.val_files = val_files
-        self.test_files = test_files
-        self.data_dir = data_dir
+        self.species_data = species_data
         self.batch_size = batch_size
         self.num_workers = num_workers
-        self.max_steps = max_steps_per_epoch
-        self.gene_col_name = gene_col_name
-        self.filter_to_vocab = filter_to_vocab
-        self.filter_outliers = filter_outliers
-        self.min_expressed_genes = min_expressed_genes
+        self.val_split = val_split
+        self.test_split = test_split
         self.seed = seed
-        self.normalize_to_scale = normalize_to_scale
-        self.clip_counts = clip_counts
-        self.log_norm_counts = log_norm_counts
-        self.species_map = species_map
-        self.gene_vocab = gene_vocab
+
+        self.train_dataset = None
+        self.val_dataset = None
+        self.test_dataset = None
+        
+        # Set random seed for reproducibility
+        np.random.seed(seed)
+
+    def _load_species_data(self, data):
+        """Load and concatenate data for a single species."""
+        if isinstance(data, (str, list)):
+            # Load from file(s)
+            if isinstance(data, str):
+                data = [data]
+            adatas = [ad.read_h5ad(path) if isinstance(path, str) else path for path in data]
+            species_adata = ad.concat(adatas) if len(adatas) > 1 else adatas[0]
+        else:
+            # Direct AnnData object(s)
+            if isinstance(data, list):
+                species_adata = ad.concat(data) if len(data) > 1 else data[0]
+            else:
+                species_adata = data
+        
+        # Remove expression data from raw and layers and convert to sparse
+        del species_adata.raw
+        del species_adata.layers
+        if not sp.sparse.issparse(species_adata.X):
+            species_adata.X = sp.sparse.csr_matrix(species_adata.X)
+            
+        return species_adata
+
+    def _split_species_data(self, adata, train_frac=0.8, val_frac=0.1, test_frac=0.1):
+        """Split AnnData object into train/val/test sets."""
+        n_cells = adata.n_obs
+        indices = np.random.permutation(n_cells)
+        
+        train_size = int(train_frac * n_cells)
+        val_size = int(val_frac * n_cells)
+        
+        train_idx = indices[:train_size]
+        val_idx = indices[train_size:train_size + val_size]
+        test_idx = indices[train_size + val_size:]
+        
+        return train_idx, val_idx, test_idx
 
     def setup(self, stage: Optional[str] = None):
         """Set up datasets for each stage."""
+        # Load and split data for each species
+        train_data = {}
+        val_data = {}
+        test_data = {}
+        
+        for species, data in self.species_data.items():
+            # Load data for this species
+            species_adata = self._load_species_data(data)
+            species_adata.obs["species"] = species
+            
+            # Split the data
+            train_frac = 1.0 - self.val_split - self.test_split
+            train_idx, val_idx, test_idx = self._split_species_data(
+                species_adata, 
+                train_frac=train_frac,
+                val_frac=self.val_split,
+                test_frac=self.test_split
+            )
+            
+            # Create split datasets
+            train_data[species] = species_adata[train_idx].copy()
+            val_data[species] = species_adata[val_idx].copy()
+            test_data[species] = species_adata[test_idx].copy()
+        
         if stage == "fit" or stage is None:
             self.train_dataset = CrossSpeciesDataset(
-                files_list=self.train_files,
-                species_map=self.species_map,
-                gene_vocab=self.gene_vocab,
-                data_dir=self.data_dir,
+                species_data=train_data,
                 batch_size=self.batch_size,
-                max_steps=self.max_steps,
-                gene_col_name=self.gene_col_name,
-                filter_to_vocab=self.filter_to_vocab,
-                filter_outliers=self.filter_outliers,
-                min_expressed_genes=self.min_expressed_genes,
                 seed=self.seed,
-                normalize_to_scale=self.normalize_to_scale,
-                clip_counts=self.clip_counts,
-                log_norm_counts=self.log_norm_counts,
+            )
+            
+            self.val_dataset = CrossSpeciesDataset(
+                species_data=val_data,
+                batch_size=self.batch_size,
+                seed=self.seed,
             )
 
-            if self.val_files is not None:
-                self.val_dataset = CrossSpeciesDataset(
-                    files_list=self.val_files,
-                    species_map=self.species_map,
-                    gene_vocab=self.gene_vocab,
-                    data_dir=self.data_dir,
-                    batch_size=self.batch_size,
-                    max_steps=self.max_steps // 10,  # Fewer steps for validation
-                    gene_col_name=self.gene_col_name,
-                    filter_to_vocab=self.filter_to_vocab,
-                    filter_outliers=self.filter_outliers,
-                    min_expressed_genes=self.min_expressed_genes,
-                    seed=self.seed,
-                    normalize_to_scale=self.normalize_to_scale,
-                    clip_counts=self.clip_counts,
-                    log_norm_counts=self.log_norm_counts,
-                )
-
         if stage == "test" or stage is None:
-            if self.test_files is not None:
-                self.test_dataset = CrossSpeciesDataset(
-                    files_list=self.test_files,
-                    species_map=self.species_map,
-                    gene_vocab=self.gene_vocab,
-                    data_dir=self.data_dir,
-                    batch_size=self.batch_size,
-                    max_steps=self.max_steps // 10,  # Fewer steps for testing
-                    gene_col_name=self.gene_col_name,
-                    filter_to_vocab=self.filter_to_vocab,
-                    filter_outliers=self.filter_outliers,
-                    min_expressed_genes=self.min_expressed_genes,
-                    seed=self.seed,
-                    normalize_to_scale=self.normalize_to_scale,
-                    clip_counts=self.clip_counts,
-                    log_norm_counts=self.log_norm_counts,
-                )
+            self.test_dataset = CrossSpeciesDataset(
+                species_data=test_data,
+                batch_size=self.batch_size,
+                seed=self.seed,
+            )
 
     def train_dataloader(self):
         """Get training dataloader."""
         return DataLoader(
             self.train_dataset,
-            batch_size=None,  # Dataset already yields batches
+            batch_size=None,
             num_workers=self.num_workers,
-            pin_memory=True,
         )
 
     def val_dataloader(self):
         """Get validation dataloader."""
-        if not hasattr(self, "val_dataset"):
-            return None
-
         return DataLoader(
             self.val_dataset,
-            batch_size=None,  # Dataset already yields batches
+            batch_size=None,
             num_workers=self.num_workers,
-            pin_memory=True,
         )
 
     def test_dataloader(self):
         """Get test dataloader."""
-        if not hasattr(self, "test_dataset"):
-            return None
-
         return DataLoader(
             self.test_dataset,
-            batch_size=None,  # Dataset already yields batches
+            batch_size=None,
             num_workers=self.num_workers,
-            pin_memory=True,
         )
