@@ -299,7 +299,7 @@ class CrossSpeciesVAE(pl.LightningModule):
         n_genes: int,
         n_species: int,
         n_latent: int = 32,
-        hidden_dims: list = [128, 256, 512],
+        hidden_dims: list = [512, 256, 128],
         dropout_rate: float = 0.1,
         homology_edges: torch.Tensor = None,
         homology_scores: torch.Tensor = None,

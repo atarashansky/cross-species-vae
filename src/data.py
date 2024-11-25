@@ -64,11 +64,9 @@ class CrossSpeciesDataset(IterableDataset):
         block_diag_X = sp.sparse.block_diag([data.X for data in species_list], format="csr")
         concat_obs = pd.concat([data.obs for data in species_list])
         concat_var = pd.concat([data.var for data in species_list])
-        var_names = pd.concat([data.var_names for data in species_list])
-        var_names = pd.Index(var_names)
+        var_names = pd.Index(sum([list(data.var_names) for data in species_list], []))
         concat_var.index = var_names
-        obs_names = pd.concat([data.obs_names for data in species_list])
-        obs_names = pd.Index(obs_names)
+        obs_names = pd.Index(sum([list(data.obs_names) for data in species_list], []))
         concat_obs.index = obs_names
 
         uns = {}
