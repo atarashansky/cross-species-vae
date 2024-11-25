@@ -288,9 +288,9 @@ class CrossSpeciesVAE(pl.LightningModule):
         warmup_epochs: float = 0.1,
         num_nodes: int = 1,
         num_gpus_per_node: int = 1,
-        gradient_accumulation_steps: int = 1,
-        batch_size: int = 128,
-        temperature: float = 0.1,
+        # gradient_accumulation_steps: int = 1,
+        # batch_size: int = 128,
+        temperature: float = 1.0,
         gradient_clip_val: float = 1.0,
         gradient_clip_algorithm: str = "norm",
     ):
@@ -335,15 +335,14 @@ class CrossSpeciesVAE(pl.LightningModule):
         self.num_nodes = num_nodes
         self.num_gpus_per_node = num_gpus_per_node
         self.world_size = num_nodes * num_gpus_per_node
-        self.global_batch_size = (
-            batch_size * self.world_size * gradient_accumulation_steps
-        )
 
         # Register homology information with correct dtype
         self.register_buffer("homology_edges", homology_edges)
-        self.register_buffer(
-            "homology_scores", homology_scores.float()
-        )  # Convert to float
+        self.homology_scores = nn.Parameter(homology_scores.float())
+        
+        with torch.no_grad():
+            # Scale initial scores to reasonable range for Gumbel-Softmax
+            self.homology_scores.data = self.homology_scores.data / self.temperature
 
         # Initialize encoder and decoder
         self.encoder = Encoder(
@@ -455,9 +454,7 @@ class CrossSpeciesVAE(pl.LightningModule):
         gene_latents = F.normalize(gene_latents, dim=1)
 
         # Get homology edge weights
-        edge_weights = F.gumbel_softmax(
-            self.homology_scores, tau=self.temperature, hard=True
-        )
+        edge_weights = F.gumbel_softmax(self.homology_scores, tau=self.temperature)
 
         # Compute positive similarities (homologous genes)
         pos_similarities = (
@@ -516,9 +513,15 @@ class CrossSpeciesVAE(pl.LightningModule):
 
             neg_loss = -torch.log(1 - torch.sigmoid(neg_similarities) + 1e-8).mean()
 
-            return (pos_loss + neg_loss) / 2
+            # Add L2 regularization on homology scores
+            score_reg = 0.01 * torch.mean(self.homology_scores ** 2)
 
-        return pos_loss
+            return (pos_loss + neg_loss) / 2 + score_reg
+
+        # Add L2 regularization on homology scores
+        score_reg = 0.01 * torch.mean(self.homology_scores ** 2)
+        
+        return pos_loss + score_reg
 
     def training_step(
         self, batch: SparseExpressionData, batch_idx: int
@@ -548,25 +551,41 @@ class CrossSpeciesVAE(pl.LightningModule):
         encoded = self.encode(batch)
         reconstruction = self.decode(encoded, batch)
 
-        # Reconstruction loss
+        # Add small epsilon to prevent log(0)
+        reconstruction = torch.clamp(reconstruction, min=1e-6)
+        
+        # Ensure target values are non-negative
+        target = torch.clamp(batch.values, min=0)
+        
+        # Compute Poisson NLL loss with log_input=False since we're already handling positive values
         recon_loss = F.poisson_nll_loss(
-            reconstruction, batch.values.view(-1, 1), reduction="mean"
+            reconstruction,
+            target,
+            log_input=False,
+            full=True,
+            reduction="mean"
         )
-
+        
         # KL loss (using already computed distributions)
         kl_loss = 0.0
-        for _, species_latent in encoded.species_latents.items():
-            kl_loss += -0.5 * torch.mean(1 + species_latent.logvar - species_latent.mu.pow(2) - species_latent.logvar.exp())
-        kl_loss += -0.5 * torch.mean(
+        for species_idx, species_latent in encoded.species_latents.items():
+            species_kl = -0.5 * torch.mean(
+                1 + species_latent.logvar - species_latent.mu.pow(2) - species_latent.logvar.exp()
+            )
+            kl_loss += species_kl
+        
+        # Global KL
+        global_kl = -0.5 * torch.mean(
             1 + encoded.global_logvar - encoded.global_mu.pow(2) - encoded.global_logvar.exp()
         )
 
+        kl_loss += global_kl
         # Concatenate all latents for homology loss
 
         homology_loss = self.homology_loss(encoded, batch)
 
         # Total loss
-        total_loss = recon_loss + kl_loss + homology_loss
+        total_loss = 0.2 * recon_loss + kl_loss  + 0.2 * homology_loss
 
         # Clear any cached tensors
         torch.cuda.empty_cache()
@@ -612,6 +631,7 @@ class CrossSpeciesVAE(pl.LightningModule):
         # Add memory logging at the end of validation step
         self._log_memory_stats("val", batch.batch_size)
 
+        print(step_output)
         return step_output
 
     def on_validation_epoch_end(self) -> None:
@@ -672,8 +692,7 @@ class CrossSpeciesVAE(pl.LightningModule):
     def on_train_start(self):
         """Calculate warmup steps when training starts."""
         if self.warmup_steps is None:
-            total_samples = len(self.trainer.train_dataloader.dataset)
-            steps_per_epoch = total_samples / self.global_batch_size
+            steps_per_epoch = len(self.trainer.train_dataloader.dataset)
             self.warmup_steps = int(steps_per_epoch * self.warmup_epochs)
             print(f"Warmup steps calculated: {self.warmup_steps}")
 
@@ -700,3 +719,19 @@ class CrossSpeciesVAE(pl.LightningModule):
         if cuda.is_available():
             # Clear cache to get more accurate measurements
             cuda.empty_cache()
+
+    @torch.no_grad()
+    def inference(self, batch: SparseExpressionData) -> EncoderOutput:
+        """
+        Run inference on a batch of data to get latent representations.
+        
+        Args:
+            batch: SparseExpressionData containing the input data
+            
+        Returns:
+            EncoderOutput containing species-specific and global latent representations
+        """
+        self.eval()  # Set model to evaluation mode
+        encoded = self.encode(batch)
+        self.train()  # Reset model to training mode
+        return encoded

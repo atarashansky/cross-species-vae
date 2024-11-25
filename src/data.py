@@ -188,6 +188,15 @@ class CrossSpeciesDataset(IterableDataset):
             indices = self._get_batch_indices()
             yield self._create_sparse_batch(indices)
 
+    def get_full_dataset_batch(self):
+        """Create a single batch containing all cells in the dataset."""
+        # Get all indices in order
+        all_indices = np.concatenate([
+            self.species_indices[species] for species in self.species_names
+        ])
+        
+        return self._create_sparse_batch(all_indices)
+
 
 class CrossSpeciesDataModule(pl.LightningDataModule):
     """PyTorch Lightning data module for cross-species data."""
@@ -351,3 +360,22 @@ class CrossSpeciesDataModule(pl.LightningDataModule):
         if self.train_dataset is None:
             raise RuntimeError("DataModule not set up yet. Call setup() first.")
         return len(self.train_dataset.species_names)
+
+    def get_full_dataset(self, split="train"):
+        """
+        Get a single batch containing all cells for the specified split.
+        
+        Args:
+            split: One of "train", "val", or "test"
+            
+        Returns:
+            SparseExpressionData containing all cells from the specified split
+        """
+        if not hasattr(self, f"{split}_dataset"):
+            raise ValueError(f"Invalid split: {split}. Must be one of: train, val, test")
+            
+        dataset = getattr(self, f"{split}_dataset")
+        if dataset is None:
+            raise RuntimeError(f"Dataset for split '{split}' not set up yet. Call setup() first.")
+            
+        return dataset.get_full_dataset_batch()
