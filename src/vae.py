@@ -312,13 +312,34 @@ class ScalableCrossSpeciesVAE(pl.LightningModule):
         num_gpus_per_node: int = 1,
         gradient_accumulation_steps: int = 1,
         batch_size: int = 128,
-        max_steps: int = 100000,
-        max_epochs: int = None,
-        max_steps_per_epoch: int = 5000,
         temperature: float = 0.1,
         gradient_clip_val: float = 1.0,
         gradient_clip_algorithm: str = "norm",
     ):
+        """
+        Initialize VAE model.
+
+        Args:
+            n_genes: Number of genes in vocabulary
+            n_species: Number of species
+            n_latent: Dimension of latent space
+            hidden_dims: List of hidden dimensions for encoder/decoder
+            dropout_rate: Dropout rate
+            homology_edges: Tensor of homology edges
+            homology_scores: Tensor of homology edge scores
+            species_dim: Dimension of species embedding
+            l1_lambda: L1 regularization weight
+            learning_rate: Initial learning rate
+            min_learning_rate: Minimum learning rate for scheduler
+            warmup_steps: Number of warmup steps for learning rate
+            num_nodes: Number of compute nodes
+            num_gpus_per_node: Number of GPUs per node
+            gradient_accumulation_steps: Number of gradient accumulation steps
+            batch_size: Batch size per GPU
+            temperature: Temperature for sampling
+            gradient_clip_val: Maximum gradient norm
+            gradient_clip_algorithm: Algorithm for gradient clipping
+        """
         super().__init__()
         self.save_hyperparameters()
 
@@ -336,12 +357,6 @@ class ScalableCrossSpeciesVAE(pl.LightningModule):
         self.world_size = num_nodes * num_gpus_per_node
         self.global_batch_size = (
             batch_size * self.world_size * gradient_accumulation_steps
-        )
-        self.num_steps_per_epoch = (
-            min(max_steps_per_epoch, max_steps) if max_steps else max_steps_per_epoch
-        )
-        self.total_steps = (
-            max_steps if max_steps else max_epochs * self.num_steps_per_epoch
         )
 
         # Register homology information with correct dtype
@@ -376,7 +391,7 @@ class ScalableCrossSpeciesVAE(pl.LightningModule):
         self.prev_gpu_memory = 0
         self.max_gpu_memory = 0
 
-        # Store new parameters
+        # Store learning rate scheduler parameters
         self.min_learning_rate = min_learning_rate
         self.warmup_steps = warmup_steps
 
@@ -753,7 +768,7 @@ class ScalableCrossSpeciesVAE(pl.LightningModule):
             else:
                 # Cosine decay with minimum learning rate
                 progress = float(current_step - self.warmup_steps) / float(
-                    max(1, self.total_steps - self.warmup_steps)
+                    max(1, self.trainer.estimated_stepping_batches - self.warmup_steps)
                 )
                 return max(
                     self.min_learning_rate / self.learning_rate,  # Convert to ratio
