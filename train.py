@@ -77,6 +77,9 @@ data_module.setup()
 model = CrossSpeciesVAE(
     n_genes=data_module.n_genes,
     n_species=data_module.n_species,
+    homology_edges=homology_edges,
+    homology_scores=homology_scores,
+    batch_size=data_module.batch_size,
     n_latent=128,
     hidden_dims=[512, 256, 128],
     dropout_rate=0.1,
@@ -88,8 +91,6 @@ model = CrossSpeciesVAE(
     gradient_accumulation_steps=1,
     temperature=0.1,
     gradient_clip_val=1.0,
-    homology_edges=homology_edges,
-    homology_scores=homology_scores
 )
 
 # Initialize the trainer

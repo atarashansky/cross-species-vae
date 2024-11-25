@@ -372,12 +372,8 @@ class CrossSpeciesVAE(pl.LightningModule):
 
         # Store learning rate scheduler parameters
         self.min_learning_rate = min_learning_rate
-        self.warmup_steps = warmup_epochs
-
-        # Calculate warmup steps based on steps per epoch
-        total_samples = len(self.trainer.train_dataloader.dataset)
-        steps_per_epoch = total_samples / self.global_batch_size
-        self.warmup_steps = int(steps_per_epoch * warmup_epochs)
+        self.warmup_epochs = warmup_epochs
+        self.warmup_steps = None
 
     def _log_memory_stats(self, step_type: str, batch_size: int):
         """Log current GPU memory usage."""
@@ -638,16 +634,17 @@ class CrossSpeciesVAE(pl.LightningModule):
 
     def configure_optimizers(self):
         """Configure optimizer with improved learning rate scheduler."""
-        print("CONFIGURED OPTIMIZER")
-        
-        optimizer = torch.optim.AdamW(  # Changed to AdamW for better stability
+        optimizer = torch.optim.AdamW(
             self.parameters(),
             lr=self.learning_rate,
-            weight_decay=0.01,  # Added small weight decay
+            weight_decay=0.01,
         )
 
         # Create custom learning rate schedule with warmup
         def lr_lambda(current_step: int):
+            if self.warmup_steps is None:  # Default to 100 steps if not yet calculated
+                return 1.0
+            
             if current_step < self.warmup_steps:
                 # Linear warmup
                 return float(current_step) / float(max(1, self.warmup_steps))
@@ -671,6 +668,14 @@ class CrossSpeciesVAE(pl.LightningModule):
                 "frequency": 1,
             },
         }
+
+    def on_train_start(self):
+        """Calculate warmup steps when training starts."""
+        if self.warmup_steps is None:
+            total_samples = len(self.trainer.train_dataloader.dataset)
+            steps_per_epoch = total_samples / self.global_batch_size
+            self.warmup_steps = int(steps_per_epoch * self.warmup_epochs)
+            print(f"Warmup steps calculated: {self.warmup_steps}")
 
     def configure_gradient_clipping(
         self, optimizer, gradient_clip_val=None, gradient_clip_algorithm=None
