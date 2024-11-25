@@ -1,5 +1,5 @@
 import math
-from typing import Dict, Tuple
+from typing import Dict, Any
 
 import pytorch_lightning as pl
 import torch
@@ -7,7 +7,7 @@ from torch import cuda
 import torch.nn as nn
 import torch.nn.functional as F
 
-from src.dataclasses import SparseExpressionData
+from src.dataclasses import SparseExpressionData, EncoderOutput, SpeciesLatents, LossOutput
 
 
 
@@ -110,21 +110,16 @@ class Encoder(nn.Module):
 
     def forward(
         self,
-        x: torch.Tensor,
+        batch: SparseExpressionData,
         edge_index: torch.Tensor,
         edge_attr: torch.Tensor,
-        species_idx: torch.Tensor,
-        batch_idx: torch.Tensor,
-        gene_idx: torch.Tensor,
-    ) -> Tuple[
-        Dict[str, Tuple[torch.Tensor, torch.Tensor]], Tuple[torch.Tensor, torch.Tensor]
-    ]:
+    ) -> EncoderOutput:
         # Map species_idx to match sparse values using batch_idx
-        expanded_species_idx = species_idx[batch_idx]
+        expanded_species_idx = batch.species_idx[batch.batch_idx]
 
         # Get species embeddings and ensure correct shape
         species_emb = self.species_embedding(expanded_species_idx)
-        x = x.view(-1, 1)
+        x = batch.values.view(-1, 1)
 
         # Combine expression and species info
         h = torch.cat([x, species_emb], dim=-1)
@@ -142,7 +137,7 @@ class Encoder(nn.Module):
         features = [h]
         for gnn in self.gnn_layers:
             # Message passing with edge weights
-            msg = self.message_passing(h, edge_index, edge_weights, gene_idx)
+            msg = self.message_passing(h, edge_index, edge_weights, batch.gene_idx)
 
             # Update node features
             h = gnn(h + msg)
@@ -153,39 +148,38 @@ class Encoder(nn.Module):
 
         # Generate species-specific latent distributions
         species_latents = {}
-        unique_species = torch.unique(expanded_species_idx)
+        unique_species = torch.unique(batch.species_idx)
         for species in unique_species:
             species_mask = expanded_species_idx == species
             if species_mask.any():
                 species_features = multi_scale[species_mask]
-                # Map back to original batch indices
-                batch_map = batch_idx[species_mask]
                 mu = self.species_mu[species.item()](species_features)
                 logvar = self.species_var[species.item()](species_features)
-                species_latents[species.item()] = (mu, logvar, batch_map)
+                z = self.reparameterize(mu, logvar)
+                species_latents[species.item()] = SpeciesLatents(latent=z, species_mask=species_mask, mu=mu, logvar=logvar)
 
         # Generate global latent distribution (per-batch)
         # First, aggregate features per batch
         batch_features = torch.zeros(
-            batch_idx.max().item() + 1,
+            batch.batch_size,
             multi_scale.size(1),
             device=multi_scale.device,
             dtype=multi_scale.dtype,
         )
         batch_counts = torch.zeros(
-            batch_idx.max().item() + 1,
+            batch.batch_size,
             1,
             device=multi_scale.device,
             dtype=multi_scale.dtype,
         )
-        batch_features.index_add_(0, batch_idx, multi_scale)
-        batch_counts.index_add_(0, batch_idx, torch.ones_like(multi_scale[:, :1]))
+        batch_features.index_add_(0, batch.batch_idx, multi_scale)
+        batch_counts.index_add_(0, batch.batch_idx, torch.ones_like(multi_scale[:, :1]))
         batch_features = batch_features / batch_counts.clamp(min=1)
 
         global_mu = self.global_mu(batch_features)
         global_var = self.global_var(batch_features)
-
-        return species_latents, (global_mu, global_var)
+        global_latent = self.reparameterize(global_mu, global_var)
+        return EncoderOutput(species_latents = species_latents, global_latent = global_latent, global_mu=global_mu, global_logvar = global_var)
 
 
 class Decoder(nn.Module):
@@ -226,69 +220,47 @@ class Decoder(nn.Module):
 
     def forward(
         self,
-        species_latents: Dict[int, Tuple[torch.Tensor, torch.Tensor]],
-        global_latent: torch.Tensor,
-        species_idx: torch.Tensor,
-        gene_idx: torch.Tensor = None,
-        batch_idx: torch.Tensor = None,
+        encoded: EncoderOutput,
+        batch: SparseExpressionData,
     ) -> torch.Tensor:
         """Decode latent vectors back to gene expression space.
 
         Args:
-            species_latents: Dict mapping species ID to (latent_vector, batch_mapping)
+            species_latents: Dict mapping species ID to (latent_vector, species_mask)
             global_latent: Global latent vector per batch
-            species_idx: Species index for each batch
-            gene_idx: Gene indices to decode (for sparse output)
-            batch_idx: Batch indices for each gene (for sparse output)
+            batch: SparseExpressionData containing batch indices, gene indices, and species indices
         """
-        reconstructions = []
+        # Initialize output tensor to match input size
+        output = torch.zeros_like(batch.values)
+        
         # Process each species
         for i in range(len(self.species_decoders)):
             decoder = self.species_decoders[i]
-            if i in species_latents:
-                # Get latent vector and batch mapping
-                z, batch_map = species_latents[i]
-                # Get corresponding global latents using batch indices
-                expanded_global = global_latent[batch_map]
+            if i in encoded.species_latents:
+                # Get latent vector and batch mapping for this species
+                species_latent = encoded.species_latents[i] 
+                z, species_mask = species_latent.latent, species_latent.species_mask
+
+                # Get corresponding batch indices
+                batch_species_idx = batch.batch_idx[species_mask]
+                gene_species_idx = batch.gene_idx[species_mask]
+
+                # Get corresponding global latents
+                expanded_global = encoded.global_latent[batch_species_idx]
                 combined_z = torch.cat([z, expanded_global], dim=1)
-
-                # If gene_idx is provided, only decode specified genes
-                if gene_idx is not None and batch_idx is not None:
-                    # Get indices for this species
-                    species_mask = batch_idx.new_zeros(
-                        batch_idx.size(0), dtype=torch.bool
-                    )
-                    for idx, map_idx in enumerate(batch_map):
-                        species_mask |= batch_idx == map_idx
-
-                    if not species_mask.any():
-                        continue
-
-                    # Get latent vectors for each gene's batch
-                    gene_latents = combined_z[batch_idx[species_mask]]
-
-                    # Get the genes for this species
-                    species_genes = gene_idx[species_mask]
-
-                    # Decode to full gene space first
-                    full_output = decoder(gene_latents)
-
-                    # Only keep the columns corresponding to the requested genes
-                    species_output = full_output.gather(1, species_genes.unsqueeze(1))
-
-                    # Apply softplus only to the required genes
-                    species_output = self.activation(species_output)
-                    reconstructions.append(species_output)
-                else:
-                    # Decode all genes (dense output) - not recommended for training
-                    output = decoder(combined_z)
-                    output = self.activation(output)
-                    reconstructions.append(output)
-
-        if not reconstructions:
-            return torch.tensor([], device=global_latent.device)
-
-        return torch.cat(reconstructions, dim=0)
+                
+                # Decode to full gene space
+                decoded = decoder(combined_z)
+                
+                species_output = decoded[batch_species_idx, gene_species_idx]
+                
+                # Apply softplus activation
+                species_output = self.activation(species_output)
+                
+                # Place the outputs in the correct positions in the output tensor
+                output[species_mask] = species_output
+        
+        return output
 
 
 class CrossSpeciesVAE(pl.LightningModule):
@@ -298,11 +270,11 @@ class CrossSpeciesVAE(pl.LightningModule):
         self,
         n_genes: int,
         n_species: int,
+        homology_edges: torch.Tensor,
+        homology_scores: torch.Tensor,
         n_latent: int = 32,
         hidden_dims: list = [512, 256, 128],
         dropout_rate: float = 0.1,
-        homology_edges: torch.Tensor = None,
-        homology_scores: torch.Tensor = None,
         species_dim: int = 32,
         l1_lambda: float = 0.01,
         learning_rate: float = 1e-3,
@@ -354,17 +326,18 @@ class CrossSpeciesVAE(pl.LightningModule):
         self.gradient_clip_algorithm = gradient_clip_algorithm
 
         # Training configuration
+        self.num_nodes = num_nodes
+        self.num_gpus_per_node = num_gpus_per_node
         self.world_size = num_nodes * num_gpus_per_node
         self.global_batch_size = (
             batch_size * self.world_size * gradient_accumulation_steps
         )
 
         # Register homology information with correct dtype
-        if homology_edges is not None:
-            self.register_buffer("homology_edges", homology_edges)
-            self.register_buffer(
-                "homology_scores", homology_scores.float()
-            )  # Convert to float
+        self.register_buffer("homology_edges", homology_edges)
+        self.register_buffer(
+            "homology_scores", homology_scores.float()
+        )  # Convert to float
 
         # Initialize encoder and decoder
         self.encoder = Encoder(
@@ -422,79 +395,59 @@ class CrossSpeciesVAE(pl.LightningModule):
 
     def encode(
         self, batch: SparseExpressionData
-    ) -> Tuple[
-        Dict[int, Tuple[torch.Tensor, torch.Tensor]], Tuple[torch.Tensor, torch.Tensor]
-    ]:
+    ) -> EncoderOutput:
         """Encode batch of data into latent space."""
-        # Create dense tensor of expression values
-        x = batch.values.unsqueeze(-1)
-
         # Get species-specific and global latent distributions
-        species_latents_dist, global_latent_dist = self.encoder(
-            x=x,
+        encoded = self.encoder(
+            batch,
             edge_index=self.homology_edges,
-            edge_attr=self.homology_scores,
-            species_idx=batch.species_idx,
-            batch_idx=batch.batch_idx,
-            gene_idx=batch.gene_idx,
+            edge_attr=self.homology_scores
         )
-
-        # Sample from distributions
-        species_latents = {}
-        for species_idx, (mu, logvar, batch_map) in species_latents_dist.items():
-            species_latents[species_idx] = (self.reparameterize(mu, logvar), batch_map)
-
-        global_mu, global_logvar = global_latent_dist
-        global_latent = self.reparameterize(global_mu, global_logvar)
-
-        return species_latents, global_latent
+        return encoded
 
     def decode(
         self,
-        species_latents: Dict[int, Tuple[torch.Tensor, torch.Tensor]],
-        global_latent: torch.Tensor,
-        species_idx: torch.Tensor,
-        gene_idx: torch.Tensor = None,
-        batch_idx: torch.Tensor = None,
+        encoded: EncoderOutput,
+        batch: SparseExpressionData,
     ) -> torch.Tensor:
         """Decode latent vectors back to gene expression space."""
         return self.decoder(
-            species_latents, global_latent, species_idx, gene_idx, batch_idx
+            encoded, batch
         )
 
     def forward(self, batch: SparseExpressionData) -> torch.Tensor:
         """Forward pass through the model."""
         # Encode
-        species_latents, global_latent = self.encode(batch)
+        encoded = self.encode(batch)
 
         # Decode
-        reconstruction = self.decode(
-            species_latents,
-            global_latent,
-            batch.species_idx,
-            batch.gene_idx,
-            batch.batch_idx,
-        )
+        reconstruction = self.decode(encoded, batch)
 
         return reconstruction
 
     def homology_loss(
         self,
-        z: torch.Tensor,
-        species_idx: torch.Tensor,
-        batch_idx: torch.Tensor,
-        gene_idx: torch.Tensor,
+        encoded: EncoderOutput,
+        batch: SparseExpressionData,
     ) -> torch.Tensor:
+        device = encoded.global_latent.device
+
         if not hasattr(self, "homology_edges"):
-            return torch.tensor(0.0, device=z.device)
+            return torch.tensor(0.0, device=device)
+
+        z = []
+        for species_idx in range(self.n_species):
+            if species_idx in encoded.species_latents:
+                z.append(encoded.species_latents[species_idx].latent)
+        z = torch.cat(z, dim=0)
 
         # Aggregate latent vectors per gene
         n_genes = self.n_genes
         with torch.no_grad():
             gene_latents = torch.zeros(n_genes, z.size(1), device=z.device)
             gene_counts = torch.zeros(n_genes, 1, device=z.device)
-        gene_latents.index_add_(0, gene_idx, z)
-        gene_counts.index_add_(0, gene_idx, torch.ones_like(z[:, :1]))
+        gene_latents.index_add_(0, batch.gene_idx, z)
+        gene_counts.index_add_(0, batch.gene_idx, torch.ones_like(z[:, :1]))
         gene_latents = gene_latents / gene_counts.clamp(min=1)
 
         # Normalize gene latents
@@ -521,7 +474,7 @@ class CrossSpeciesVAE(pl.LightningModule):
         ).mean()
 
         # Compute negative similarities with hard negative mining
-        unique_genes = torch.unique(gene_idx)
+        unique_genes = torch.unique(batch.gene_idx)
         if len(unique_genes) > 1:
             # Create mapping from original gene indices to new contiguous indices
             gene_to_idx = torch.zeros(n_genes, dtype=torch.long, device=z.device)
@@ -571,78 +524,12 @@ class CrossSpeciesVAE(pl.LightningModule):
     ) -> torch.Tensor:
         """Training step."""
         # Add garbage collection if needed
-        import gc
+        loss = self.compute_loss(batch)
 
-        # Single forward pass through encoder
-        species_latents_dist, global_latent_dist = self.encoder(
-            x=batch.values.unsqueeze(-1),
-            edge_index=self.homology_edges,
-            edge_attr=self.homology_scores,
-            species_idx=batch.species_idx,
-            batch_idx=batch.batch_idx,
-            gene_idx=batch.gene_idx,
-        )
-
-        # Sample from distributions
-        species_latents = {}
-        for species_idx, (mu, logvar, batch_map) in species_latents_dist.items():
-            species_latents[species_idx] = (self.reparameterize(mu, logvar), batch_map)
-
-        global_mu, global_logvar = global_latent_dist
-        global_latent = self.reparameterize(global_mu, global_logvar)
-
-        # Decode
-        reconstruction = self.decoder(
-            species_latents,
-            global_latent,
-            batch.species_idx,
-            batch.gene_idx,
-            batch.batch_idx,
-        )
-
-        # Reconstruction loss
-        recon_loss = F.poisson_nll_loss(
-            reconstruction, batch.values.view(-1, 1), reduction="mean"
-        )
-
-        # KL loss (using already computed distributions)
-        kl_loss = 0.0
-        for species_idx, (mu, logvar, _) in species_latents_dist.items():
-            kl_loss += -0.5 * torch.mean(1 + logvar - mu.pow(2) - logvar.exp())
-        kl_loss += -0.5 * torch.mean(
-            1 + global_logvar - global_mu.pow(2) - global_logvar.exp()
-        )
-
-        # Homology loss
-        species_latents = {}
-        for species_idx, (mu, logvar, batch_map) in species_latents_dist.items():
-            species_latents[species_idx] = (self.reparameterize(mu, logvar), batch_map)
-        global_latent = self.reparameterize(global_mu, global_logvar)
-
-        # Concatenate all latents for homology loss
-        all_latents = []
-        for species_idx in range(self.n_species):
-            if species_idx in species_latents:
-                all_latents.append(species_latents[species_idx][0])
-        all_latents = torch.cat(all_latents, dim=0)
-
-        homology_loss = self.homology_loss(
-            all_latents, batch.species_idx, batch.batch_idx, batch.gene_idx
-        )
-
-        # Total loss
-        total_loss = recon_loss + kl_loss + homology_loss
-
-        # Log metrics
-        self.log("train_loss", total_loss, sync_dist=True)
-        self.log("train_recon_loss", recon_loss, sync_dist=True)
-        self.log("train_kl_loss", kl_loss, sync_dist=True)
-        self.log("train_homology_loss", homology_loss, sync_dist=True)
-
-        # Clear any cached tensors
-        torch.cuda.empty_cache()
-        gc.collect()
-
+        self.log("train_loss", loss.loss, sync_dist=True)
+        self.log("train_recon_loss", loss.recon_loss, sync_dist=True)
+        self.log("train_kl_loss", loss.kl_loss, sync_dist=True)
+        self.log("train_homology_loss", loss.homology_loss, sync_dist=True)
         # Add memory logging at the end of training step
         self._log_memory_stats("train")
 
@@ -651,88 +538,72 @@ class CrossSpeciesVAE(pl.LightningModule):
             grad_norm = torch.nn.utils.clip_grad_norm_(self.parameters(), float("inf"))
             self.log("gradient_norm", grad_norm, sync_dist=True)
 
-        return total_loss
+        return loss.loss
+
+    def compute_loss(self, batch: SparseExpressionData) -> LossOutput:
+        import gc
+
+        # Single forward pass through encoder
+        encoded = self.encode(batch)
+        reconstruction = self.decode(encoded, batch)
+
+        # Reconstruction loss
+        recon_loss = F.poisson_nll_loss(
+            reconstruction, batch.values.view(-1, 1), reduction="mean"
+        )
+
+        # KL loss (using already computed distributions)
+        kl_loss = 0.0
+        for _, species_latent in encoded.species_latents.items():
+            kl_loss += -0.5 * torch.mean(1 + species_latent.logvar - species_latent.mu.pow(2) - species_latent.logvar.exp())
+        kl_loss += -0.5 * torch.mean(
+            1 + encoded.global_logvar - encoded.global_mu.pow(2) - encoded.global_logvar.exp()
+        )
+
+        # Concatenate all latents for homology loss
+
+        homology_loss = self.homology_loss(encoded, batch)
+
+        # Total loss
+        total_loss = recon_loss + kl_loss + homology_loss
+
+        # Clear any cached tensors
+        torch.cuda.empty_cache()
+        gc.collect()        
+        
+        return LossOutput(
+            loss=total_loss,
+            recon_loss=recon_loss,
+            kl_loss=kl_loss,
+            homology_loss=homology_loss,
+            reconstruction=reconstruction,
+        )
 
     def validation_step(
         self, batch: SparseExpressionData, batch_idx: int
     ) -> Dict[str, torch.Tensor]:
         """Validation step."""
         with torch.no_grad():
-            # Single forward pass through encoder (same as training)
-            species_latents_dist, global_latent_dist = self.encoder(
-                x=batch.values.unsqueeze(-1),
-                edge_index=self.homology_edges,
-                edge_attr=self.homology_scores,
-                species_idx=batch.species_idx,
-                batch_idx=batch.batch_idx,
-                gene_idx=batch.gene_idx,
-            )
-
-            # Sample from distributions (same as training)
-            species_latents = {}
-            for species_idx, (mu, logvar, batch_map) in species_latents_dist.items():
-                species_latents[species_idx] = (
-                    self.reparameterize(mu, logvar),
-                    batch_map,
-                )
-
-            global_mu, global_logvar = global_latent_dist
-            global_latent = self.reparameterize(global_mu, global_logvar)
-
-            # Decode (same as training)
-            reconstruction = self.decoder(
-                species_latents,
-                global_latent,
-                batch.species_idx,
-                batch.gene_idx,
-                batch.batch_idx,
-            )
-
-            # Reconstruction loss (fixed to match training)
-            recon_loss = F.poisson_nll_loss(
-                reconstruction, batch.values.view(-1, 1), reduction="mean"
-            )
-
-            # KL loss (same calculation as training)
-            kl_loss = 0.0
-            for species_idx, (mu, logvar, _) in species_latents_dist.items():
-                kl_loss += -0.5 * torch.mean(1 + logvar - mu.pow(2) - logvar.exp())
-            kl_loss += -0.5 * torch.mean(
-                1 + global_logvar - global_mu.pow(2) - global_logvar.exp()
-            )
-
-            # Homology loss (same as training)
-            all_latents = []
-            for species_idx in range(self.n_species):
-                if species_idx in species_latents:
-                    all_latents.append(species_latents[species_idx][0])
-            all_latents = torch.cat(all_latents, dim=0)
-
-            homology_loss = self.homology_loss(
-                all_latents, batch.species_idx, batch.batch_idx, batch.gene_idx
-            )
-
-            # Total loss (same as training)
-            total_loss = recon_loss + kl_loss + homology_loss
+            loss = self.compute_loss(batch)
 
             # Additional validation metrics
-            mse = F.mse_loss(reconstruction, batch.values.view(-1, 1))
-            mae = F.l1_loss(reconstruction, batch.values.view(-1, 1))
+            mse = F.mse_loss(loss.reconstruction, batch.values.view(-1, 1))
+            mae = F.l1_loss(loss.reconstruction, batch.values.view(-1, 1))
 
-            step_output = {
-                "val_loss": total_loss,
-                "val_recon_loss": recon_loss,
-                "val_kl_loss": kl_loss,
-                "val_homology_loss": homology_loss,
-                "val_mse": mse,
-                "val_mae": mae,
-            }
-            self.validation_step_outputs.append(step_output)
+        step_output = {
+            "val_loss": loss.loss,
+            "val_recon_loss": loss.recon_loss,
+            "val_kl_loss": loss.kl_loss,
+            "val_homology_loss": loss.homology_loss,
+            "val_mse": mse,
+            "val_mae": mae,
+        }
+        self.validation_step_outputs.append(step_output)
 
-            # Add memory logging at the end of validation step
-            self._log_memory_stats("val")
+        # Add memory logging at the end of validation step
+        self._log_memory_stats("val")
 
-            return step_output
+        return step_output
 
     def on_validation_epoch_end(self) -> None:
         """Compute validation metrics at epoch end."""
