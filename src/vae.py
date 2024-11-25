@@ -285,7 +285,7 @@ class CrossSpeciesVAE(pl.LightningModule):
         l1_lambda: float = 0.01,
         learning_rate: float = 1e-3,
         min_learning_rate: float = 1e-5,
-        warmup_steps: int = 1000,
+        warmup_epochs: float = 0.1,
         num_nodes: int = 1,
         num_gpus_per_node: int = 1,
         gradient_accumulation_steps: int = 1,
@@ -309,7 +309,7 @@ class CrossSpeciesVAE(pl.LightningModule):
             l1_lambda: L1 regularization weight
             learning_rate: Initial learning rate
             min_learning_rate: Minimum learning rate for scheduler
-            warmup_steps: Number of warmup steps for learning rate
+            warmup_epochs: Fraction of epoch for warmup steps
             num_nodes: Number of compute nodes
             num_gpus_per_node: Number of GPUs per node
             gradient_accumulation_steps: Number of gradient accumulation steps
@@ -372,9 +372,14 @@ class CrossSpeciesVAE(pl.LightningModule):
 
         # Store learning rate scheduler parameters
         self.min_learning_rate = min_learning_rate
-        self.warmup_steps = warmup_steps
+        self.warmup_steps = warmup_epochs
 
-    def _log_memory_stats(self, step_type: str):
+        # Calculate warmup steps based on steps per epoch
+        total_samples = len(self.trainer.train_dataloader.dataset)
+        steps_per_epoch = total_samples / self.global_batch_size
+        self.warmup_steps = int(steps_per_epoch * warmup_epochs)
+
+    def _log_memory_stats(self, step_type: str, batch_size: int):
         """Log current GPU memory usage."""
         if cuda.is_available():
             # Current memory in GB
@@ -389,9 +394,9 @@ class CrossSpeciesVAE(pl.LightningModule):
             self.max_gpu_memory = max(self.max_gpu_memory, max_memory)
 
             # Log metrics
-            self.log(f"{step_type}_gpu_memory", current, prog_bar=True)
-            self.log(f"{step_type}_gpu_memory_peak", max_memory, prog_bar=True)
-            self.log(f"{step_type}_gpu_memory_increase", memory_increase, prog_bar=True)
+            self.log(f"{step_type}_gpu_memory", current, prog_bar=True, batch_size=batch_size, sync_dist=True)
+            self.log(f"{step_type}_gpu_memory_peak", max_memory, prog_bar=True, batch_size=batch_size, sync_dist=True)
+            self.log(f"{step_type}_gpu_memory_increase", memory_increase, prog_bar=True, batch_size=batch_size, sync_dist=True)
 
     def encode(
         self, batch: SparseExpressionData
@@ -526,12 +531,12 @@ class CrossSpeciesVAE(pl.LightningModule):
         # Add garbage collection if needed
         loss = self.compute_loss(batch)
 
-        self.log("train_loss", loss.loss, sync_dist=True)
-        self.log("train_recon_loss", loss.recon_loss, sync_dist=True)
-        self.log("train_kl_loss", loss.kl_loss, sync_dist=True)
-        self.log("train_homology_loss", loss.homology_loss, sync_dist=True)
+        self.log("train_loss", loss.loss, sync_dist=True, batch_size=batch.batch_size)
+        self.log("train_recon_loss", loss.recon_loss, sync_dist=True, batch_size=batch.batch_size)
+        self.log("train_kl_loss", loss.kl_loss, sync_dist=True, batch_size=batch.batch_size)
+        self.log("train_homology_loss", loss.homology_loss, sync_dist=True, batch_size=batch.batch_size)
         # Add memory logging at the end of training step
-        self._log_memory_stats("train")
+        self._log_memory_stats("train", batch.batch_size)
 
         # Add gradient norm logging
         if self.trainer.global_step % 100 == 0:  # Log every 100 steps
@@ -591,12 +596,12 @@ class CrossSpeciesVAE(pl.LightningModule):
             mae = F.l1_loss(loss.reconstruction, batch.values)
 
         # Directly log metrics with sync_dist=True
-        self.log("val_loss", loss.loss, sync_dist=True)
-        self.log("val_recon_loss", loss.recon_loss, sync_dist=True)
-        self.log("val_kl_loss", loss.kl_loss, sync_dist=True)
-        self.log("val_homology_loss", loss.homology_loss, sync_dist=True)
-        self.log("val_mse", mse, sync_dist=True)
-        self.log("val_mae", mae, sync_dist=True)
+        self.log("val_loss", loss.loss, sync_dist=True, batch_size=batch.batch_size)
+        self.log("val_recon_loss", loss.recon_loss, sync_dist=True, batch_size=batch.batch_size)
+        self.log("val_kl_loss", loss.kl_loss, sync_dist=True, batch_size=batch.batch_size)
+        self.log("val_homology_loss", loss.homology_loss, sync_dist=True, batch_size=batch.batch_size)
+        self.log("val_mse", mse, sync_dist=True, batch_size=batch.batch_size)
+        self.log("val_mae", mae, sync_dist=True, batch_size=batch.batch_size)
 
         step_output = {
             "val_loss": loss.loss,
@@ -609,7 +614,7 @@ class CrossSpeciesVAE(pl.LightningModule):
         self.validation_step_outputs.append(step_output)
 
         # Add memory logging at the end of validation step
-        self._log_memory_stats("val")
+        self._log_memory_stats("val", batch.batch_size)
 
         return step_output
 
@@ -633,6 +638,8 @@ class CrossSpeciesVAE(pl.LightningModule):
 
     def configure_optimizers(self):
         """Configure optimizer with improved learning rate scheduler."""
+        print("CONFIGURED OPTIMIZER")
+        
         optimizer = torch.optim.AdamW(  # Changed to AdamW for better stability
             self.parameters(),
             lr=self.learning_rate,
