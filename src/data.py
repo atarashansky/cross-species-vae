@@ -322,3 +322,17 @@ class CrossSpeciesDataModule(pl.LightningDataModule):
             batch_size=None,
             num_workers=self.num_workers,
         )
+
+    @property
+    def n_genes(self) -> int:
+        """Total number of genes across all species."""
+        if self.train_dataset is None:
+            raise RuntimeError("DataModule not set up yet. Call setup() first.")
+        return self.train_dataset.concatenated_data.shape[1]
+
+    @property
+    def n_species(self) -> int:
+        """Number of species in the dataset."""
+        if self.train_dataset is None:
+            raise RuntimeError("DataModule not set up yet. Call setup() first.")
+        return len(self.train_dataset.species_names)

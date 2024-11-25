@@ -4,7 +4,7 @@ import torch
 import scipy as sp
 import json
 import numpy as np
-from src.vae import ScalableCrossSpeciesVAE
+from src.vae import CrossSpeciesVAE
 from src.data import CrossSpeciesDataModule
 
 if __name__ == "__main__":
@@ -83,7 +83,7 @@ if __name__ == "__main__":
     homology_scores = torch.tensor(scores)[filt]
 
     # Initialize the model
-    model = ScalableCrossSpeciesVAE(
+    model = CrossSpeciesVAE(
         n_genes=len(data_module.gene_vocab),
         n_species=len(data_module.species_map),
         n_latent=params["n_latent"],

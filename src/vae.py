@@ -11,7 +11,7 @@ from src.dataclasses import SparseExpressionData
 
 
 
-class ScalableEncoder(nn.Module):
+class Encoder(nn.Module):
     """Multi-scale encoder with species-specific and global latent spaces."""
 
     def __init__(
@@ -188,7 +188,7 @@ class ScalableEncoder(nn.Module):
         return species_latents, (global_mu, global_var)
 
 
-class ScalableDecoder(nn.Module):
+class Decoder(nn.Module):
     """Multi-scale decoder with species-specific components."""
 
     def __init__(
@@ -291,8 +291,8 @@ class ScalableDecoder(nn.Module):
         return torch.cat(reconstructions, dim=0)
 
 
-class ScalableCrossSpeciesVAE(pl.LightningModule):
-    """Scalable cross-species VAE with multi-scale encoding and species-specific components."""
+class CrossSpeciesVAE(pl.LightningModule):
+    """Cross-species VAE with multi-scale encoding and species-specific components."""
 
     def __init__(
         self,
@@ -367,7 +367,7 @@ class ScalableCrossSpeciesVAE(pl.LightningModule):
             )  # Convert to float
 
         # Initialize encoder and decoder
-        self.encoder = ScalableEncoder(
+        self.encoder = Encoder(
             n_genes=n_genes,
             n_species=n_species,
             n_latent=n_latent,
@@ -376,7 +376,7 @@ class ScalableCrossSpeciesVAE(pl.LightningModule):
             species_dim=species_dim,
         )
 
-        self.decoder = ScalableDecoder(
+        self.decoder = Decoder(
             n_genes=n_genes,
             n_species=n_species,
             n_latent=n_latent,
