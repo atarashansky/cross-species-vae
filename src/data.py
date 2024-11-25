@@ -152,7 +152,8 @@ class CrossSpeciesDataset(IterableDataset):
             gene_idx=gene_idx,
             species_idx=species_idx,
             batch_size=len(indices),
-            n_genes=len(self.concatenated_data.var_names)
+            n_genes=len(self.concatenated_data.var_names),
+            n_species=len(self.species_names),
         )
 
     def _initialize_worker_info(self):
