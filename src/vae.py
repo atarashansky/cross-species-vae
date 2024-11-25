@@ -107,7 +107,13 @@ class Encoder(nn.Module):
         out = gene_messages[gene_idx]
 
         return out
-
+    
+    def reparameterize(self, mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
+        """Reparameterization trick."""
+        std = torch.exp(0.5 * logvar)
+        eps = torch.randn_like(std)
+        return mu + eps * std
+    
     def forward(
         self,
         batch: SparseExpressionData,
@@ -116,7 +122,7 @@ class Encoder(nn.Module):
     ) -> EncoderOutput:
         # Map species_idx to match sparse values using batch_idx
         expanded_species_idx = batch.species_idx[batch.batch_idx]
-
+        
         # Get species embeddings and ensure correct shape
         species_emb = self.species_embedding(expanded_species_idx)
         x = batch.values.view(-1, 1)
@@ -387,12 +393,6 @@ class CrossSpeciesVAE(pl.LightningModule):
             self.log(f"{step_type}_gpu_memory_peak", max_memory, prog_bar=True)
             self.log(f"{step_type}_gpu_memory_increase", memory_increase, prog_bar=True)
 
-    def reparameterize(self, mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
-        """Reparameterization trick."""
-        std = torch.exp(0.5 * logvar)
-        eps = torch.randn_like(std)
-        return mu + eps * std
-
     def encode(
         self, batch: SparseExpressionData
     ) -> EncoderOutput:
@@ -587,8 +587,16 @@ class CrossSpeciesVAE(pl.LightningModule):
             loss = self.compute_loss(batch)
 
             # Additional validation metrics
-            mse = F.mse_loss(loss.reconstruction, batch.values.view(-1, 1))
-            mae = F.l1_loss(loss.reconstruction, batch.values.view(-1, 1))
+            mse = F.mse_loss(loss.reconstruction, batch.values)
+            mae = F.l1_loss(loss.reconstruction, batch.values)
+
+        # Directly log metrics with sync_dist=True
+        self.log("val_loss", loss.loss, sync_dist=True)
+        self.log("val_recon_loss", loss.recon_loss, sync_dist=True)
+        self.log("val_kl_loss", loss.kl_loss, sync_dist=True)
+        self.log("val_homology_loss", loss.homology_loss, sync_dist=True)
+        self.log("val_mse", mse, sync_dist=True)
+        self.log("val_mae", mae, sync_dist=True)
 
         step_output = {
             "val_loss": loss.loss,

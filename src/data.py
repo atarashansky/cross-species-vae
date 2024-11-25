@@ -115,18 +115,23 @@ class CrossSpeciesDataset(IterableDataset):
                     selected_idx
                 )
             else:
+                selected_idx = available
+                num_missing = cells_per_species - len(selected_idx)
                 # Sample with replacement from original indices
-                selected_idx = self.rng.choice(
-                    self.species_indices[species], 
-                    cells_per_species, 
-                    replace=True
-                )
+                selected_idx = np.concatenate([
+                    selected_idx,
+                    self.rng.choice(
+                        self.species_indices[species], 
+                        num_missing, 
+                        replace=True
+                    )
+                ])
             
             batch_indices.extend(selected_idx)
             
             # Track cells seen from largest dataset
             if species == self.largest_species:
-                self.seen_largest_dataset.update(selected_idx)
+                self.seen_largest_dataset.update([i for i in selected_idx])
         
         return np.array(batch_indices)
 
@@ -137,13 +142,14 @@ class CrossSpeciesDataset(IterableDataset):
     def _create_sparse_batch(self, indices):
         """Create a SparseExpressionData batch from indices."""
         batch_data = self.concatenated_data[indices]
-        
+        batch_idx, gene_idx = batch_data.X.nonzero()
         values = torch.from_numpy(batch_data.X.data.astype(np.float32))
-        gene_idx = torch.from_numpy(batch_data.X.indices.astype(np.int64))
-        batch_idx = torch.from_numpy(batch_data.X.indptr.astype(np.int64))
+        gene_idx = torch.from_numpy(gene_idx.astype(np.int32))
+        batch_idx = torch.from_numpy(batch_idx.astype(np.int32))
+        
         species_idx = torch.tensor(
             [self.species_to_idx[s] for s in batch_data.obs["species"]],
-            dtype=torch.int64
+            dtype=torch.int32
         )
         
         return SparseExpressionData(
@@ -162,7 +168,17 @@ class CrossSpeciesDataset(IterableDataset):
         if worker_info is not None:
             self.worker_id = worker_info.id
             self.num_workers = worker_info.num_workers
-
+    
+    def __len__(self):
+        """Return the number of batches per epoch."""
+        # We sample batch_size cells total, evenly distributed across species
+        cells_per_species = self.batch_size // len(self.species_names)
+        # Number of batches needed to see all cells from largest species once
+        cells_in_largest = self.n_cells_per_species[self.largest_species]
+        # Since we sample cells_per_species cells from largest dataset in each batch,
+        # we need cells_in_largest / cells_per_species batches to see all cells once
+        return int(np.ceil(cells_in_largest / cells_per_species))
+    
     def __iter__(self):
         """Iterate over batches of data."""
         self._initialize_worker_info()

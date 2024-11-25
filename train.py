@@ -4,129 +4,115 @@ import torch
 import scipy as sp
 import json
 import numpy as np
+from glob import glob
+import anndata
+import pandas as pd 
 from src.vae import CrossSpeciesVAE
 from src.data import CrossSpeciesDataModule
 
-if __name__ == "__main__":
-    vocab = json.load(
-        open("data/vocab/human_mouse_zfish_mlemur/protein_emb/gene_vocab.json", "r")
-    )
-    gene_orthology = json.load(
-        open("data/vocab/orthology_groups/gene_orthology_group_vocab.json", "r")
-    )
-    size = gene_orthology["__SIZE__"]
-    gene_orthology = {k: gene_orthology[k] for k in vocab if k in gene_orthology}
+fn1 = '../samap/example_data/planarian.h5ad'
+fn2 = '../samap/example_data/schistosome.h5ad'
+fn3 = '../samap/example_data/hydra.h5ad'
 
-    # Hardcoded parameters
-    params = {
-        "n_latent": 128,  # Latent dimension
-        "hidden_dims": [128, 256, 512],  # Hidden dimensions for encoder/decoder
-        "dropout_rate": 0.1,
-        "learning_rate": 1e-3,
-        "species_dim": 32,  # Species embedding dimension
-        "l1_lambda": 0.01,  # L1 regularization strength
-        "temperature": 0.1,  # Temperature for Gumbel-Softmax
-        # Training parameters
-        "batch_size": 16,
-        "max_steps": 100000,
-        "max_epochs": 1000,
-        "max_steps_per_epoch": 500,
-        "gradient_accumulation_steps": 1,
-        "gradient_clip_val": 1.0,
-        # Distributed training
-        "num_nodes": 1,
-        "num_gpus_per_node": 1,
-        # Data parameters
-        "data_dir": "/mnt/czi-sci-ai/generate-cross-species-secondary/datasets",  # Update this path
-        "train_files": "data/train_files/train_human_mouse_zfish_mlemur.txt",
-        "val_files": "data/train_files/val_human_mouse_zfish_mlemur.txt",
-    }
+eggnogs = '../samap/example_data/eggnog/*'
 
-    train_files = open(params["train_files"]).read().split("\n")[:-1]
-    val_files = open(params["val_files"]).read().split("\n")[:-1]
+adata1 = anndata.read_h5ad(fn1)
+adata2 = anndata.read_h5ad(fn2)
+adata3 = anndata.read_h5ad(fn3)
 
-    # Set up data module
-    data_module = CrossSpeciesDataModule(
-        train_files=train_files,
-        val_files=val_files,
-        data_dir=params["data_dir"],
-        batch_size=params["batch_size"],
-        num_workers=1,
-        max_steps_per_epoch=params["max_steps_per_epoch"],
-        gene_vocab=vocab,
-        gene_col_name="ensembl_id",
-        species_map={
-            "Homo sapiens": 0,
-            "Mus musculus": 1,
-            "Microcebus murinus": 2,
-            "Danio rerio": 3,
-        },
-    )
 
-    x = []
-    y = []
-    z = []
-    for k in gene_orthology:
-        v = gene_orthology[k]
-        if not isinstance(v, list):
-            continue
-        x.extend([vocab[k]] * len(v))
-        y.extend(v)
-        z.extend([1] * len(v))
 
-    G = sp.sparse.coo_matrix((z, (x, y)), shape=(len(vocab), size))
-    G = G.dot(G.T)
-    p1, p2 = G.nonzero()
-    scores = G.data
-    filt = scores > 2
-    homology_edges = torch.tensor(np.vstack((p1, p2)).T)[filt]
-    homology_scores = torch.tensor(scores)[filt]
+dfs = []
+for f in glob(eggnogs):
+    dfs.append(pd.read_csv(f,sep='\t',header=None,skiprows=1))
 
-    # Initialize the model
-    model = CrossSpeciesVAE(
-        n_genes=len(data_module.gene_vocab),
-        n_species=len(data_module.species_map),
-        n_latent=params["n_latent"],
-        hidden_dims=params["hidden_dims"],
-        dropout_rate=params["dropout_rate"],
-        species_dim=params["species_dim"],
-        l1_lambda=params["l1_lambda"],
-        learning_rate=params["learning_rate"],
-        num_nodes=params["num_nodes"],
-        num_gpus_per_node=params["num_gpus_per_node"],
-        gradient_accumulation_steps=params["gradient_accumulation_steps"],
-        batch_size=params["batch_size"],
-        max_steps=params["max_steps"],
-        max_epochs=params["max_epochs"],
-        max_steps_per_epoch=params["max_steps_per_epoch"],
-        temperature=params["temperature"],
-        gradient_clip_val=params["gradient_clip_val"],
-        homology_edges=homology_edges,
-        homology_scores=homology_scores,
-    )
-    # Initialize the trainer
-    trainer = pl.Trainer(
-        accelerator="gpu",
-        devices=params["num_gpus_per_node"],
-        num_nodes=params["num_nodes"],
-        max_epochs=params["max_epochs"],
-        precision="16-mixed",
-        accumulate_grad_batches=params["gradient_accumulation_steps"],
-        gradient_clip_val=params["gradient_clip_val"],
-        log_every_n_steps=10,
-        deterministic=True,
-        callbacks=[
-            ModelCheckpoint(
-                dirpath="checkpoints",
-                filename="scalable_vae-{epoch:02d}-{val_loss:.2f}",
-                save_top_k=3,
-                monitor="val_loss",
-                mode="min",
-            )
-        ],
-        enable_progress_bar=True,
-        # fast_dev_run=True,
-    )
+df = pd.concat(dfs,axis=0)
 
-    # Train the model
-    trainer.fit(model, data_module)
+ogs = set()
+for i in df[18].values:
+    for j in i.split(','):
+        ogs.add(j)
+ogs = list(ogs)
+
+ogs_per_gene = [i.split(',') for i in df[18].values]
+genes = df.iloc[:,0].values
+ogs_per_gene = dict(zip(genes,ogs_per_gene))
+
+indexer = pd.Series(index=ogs,data=range(len(ogs)))
+
+x = []
+y = []
+z=[]
+for i, g in enumerate(ogs_per_gene):
+    v = indexer[ogs_per_gene[g]].values
+    x.extend([i]*len(v))
+    y.extend(v)
+    z.extend(np.ones_like(v))
+    
+onehot = sp.sparse.coo_matrix((z,(x,y)),shape=(len(ogs_per_gene),len(indexer)))
+
+graph = onehot.dot(onehot.T)
+
+p1, p2 = graph.nonzero()
+scores = graph.data
+filt = scores > 2
+homology_edges = torch.tensor(np.vstack((p1,p2)).T)[filt]
+homology_scores = torch.tensor(scores)[filt]
+
+data_module = CrossSpeciesDataModule(
+    species_data = {
+        "planarian": adata1,
+        "schisto": adata2,
+        "hydra": adata3,
+    },
+    batch_size=32,
+    num_workers=0,
+    val_split=0.1,
+    test_split=0.1,
+    seed=0
+)
+data_module.setup()
+
+# Initialize the model
+model = CrossSpeciesVAE(
+    n_genes=data_module.n_genes,
+    n_species=data_module.n_species,
+    n_latent=128,
+    hidden_dims=[512, 256, 128],
+    dropout_rate=0.1,
+    species_dim=32,
+    l1_lambda=0.01,
+    learning_rate=1e-3,
+    num_nodes=1,
+    num_gpus_per_node=1,
+    gradient_accumulation_steps=1,
+    temperature=0.1,
+    gradient_clip_val=1.0,
+    homology_edges=homology_edges,
+    homology_scores=homology_scores
+)
+
+# Initialize the trainer
+trainer = pl.Trainer(
+    accelerator="gpu",
+    devices=model.num_gpus_per_node,
+    num_nodes=model.num_nodes,
+    max_epochs=10,
+    precision='16-mixed',
+    accumulate_grad_batches=1,
+    gradient_clip_val=model.gradient_clip_val,
+    gradient_clip_algorithm="norm",
+    log_every_n_steps=10,
+    deterministic=True,
+    callbacks=[ModelCheckpoint(
+        dirpath="checkpoints",
+        filename="scalable_vae-{epoch:02d}-{val_loss:.2f}",
+        save_top_k=3,
+        monitor="val_loss",
+        mode="min"
+    )],
+    enable_progress_bar=True,
+    fast_dev_run=False,
+)
+
+trainer.fit(model, data_module)
