@@ -396,7 +396,7 @@ class CrossSpeciesVAE(pl.LightningModule):
         )        
         
         homology_loss = torch.tensor(0.0, device=kl.device)
-        if hasattr(self, "homology_edges") and hasattr(self, "homology_scores"):
+        if len(self.encoders) > 1 and hasattr(self, "homology_edges") and hasattr(self, "homology_scores"):
             homology_loss = self.compute_homology_loss(predictions, batch)
         
         # Add L1 regularization for gene importance weights
