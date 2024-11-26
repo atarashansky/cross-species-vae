@@ -32,6 +32,10 @@ class GeneImportanceModule(nn.Module):
         importance = global_weights
         return x * importance
 
+    def get_l1_reg(self) -> torch.Tensor:
+        """Calculate L1 regularization for gene importance weights."""
+        return torch.mean(torch.abs(F.softplus(self.global_weights)))
+
 class Encoder(nn.Module):
     def __init__(
         self,
@@ -124,6 +128,23 @@ class Decoder(nn.Module):
     def forward(self, z: Dict[str, torch.Tensor]) -> torch.Tensor:        
         return self.decoder_net(z['z'])
 
+class SpeciesClassifier(nn.Module):
+    def __init__(self, n_latent: int, n_species: int, hidden_dim: int = 256):
+        super().__init__()
+        self.classifier = nn.Sequential(
+            nn.Linear(n_latent, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(hidden_dim, n_species)
+        )
+    
+    def forward(self, z: torch.Tensor) -> torch.Tensor:
+        return self.classifier(z)
 
 class CrossSpeciesVAE(pl.LightningModule):
     """Cross-species VAE with multi-scale encoding and species-specific components."""
@@ -131,23 +152,39 @@ class CrossSpeciesVAE(pl.LightningModule):
     def __init__(
         self,
         species_vocab_sizes: Dict[int, int],
-        homology_edges: torch.Tensor | None = None,
-        homology_scores: torch.Tensor | None = None,
+        homology_edges: Dict[int, Dict[int, torch.Tensor]] | None = None,
         n_latent: int = 32,
         hidden_dims: list = [512, 256, 128],
         dropout_rate: float = 0.1,
-        learning_rate: float = 1e-3,
+        base_learning_rate: float = 1e-3,
+        base_batch_size: int = 32,
+        batch_size: int | None = None,
         min_learning_rate: float = 1e-5,
         warmup_epochs: float = 0.1,
-        init_beta: float = 1e-3,  # Initial beta value
-        final_beta: float = 1.0,  # Final beta value
+        init_beta: float = 1e-3,
+        final_beta: float = 0.1,
         gradient_clip_val: float = 1.0,
         gradient_clip_algorithm: str = "norm",
+        species_weight: float = 0.1,
+        recon_weight: float = 1.0,
+        homology_weight: float = 0.1,
+        l1_weight: float = 0.0,
     ):
         super().__init__()
-        self.save_hyperparameters()
+        self.save_hyperparameters(ignore=['homology_edges'])
         
-        # Remove learnable beta parameter
+        # Scale learning rate based on batch size
+        if batch_size is not None:
+            self.learning_rate = base_learning_rate * (batch_size / base_batch_size)
+        else:
+            self.learning_rate = base_learning_rate
+            
+        print(f"Scaled learning rate: {self.learning_rate:.2e}")
+        
+        self.recon_weight = recon_weight
+        self.homology_weight = homology_weight
+        self.l1_weight = l1_weight
+
         self.init_beta = init_beta
         self.final_beta = final_beta
         self.current_beta = init_beta  # Track current beta value
@@ -178,13 +215,22 @@ class CrossSpeciesVAE(pl.LightningModule):
             for species_id, vocab_size in species_vocab_sizes.items()
         })
 
-        # Register homology information
-        if homology_edges is not None and homology_scores is not None:
-            self.register_buffer("homology_edges", homology_edges)
-            self.homology_scores = nn.Parameter(homology_scores.float())
+        # Register homology information with learnable scores
+        if homology_edges is not None:
+            self.homology_edges = homology_edges
+            
+            # Initialize learnable scores for each species pair
+            self.homology_scores = nn.ParameterDict({
+                str(src_id): nn.ParameterDict({
+                    str(dst_id): nn.Parameter(
+                        torch.ones(len(edges), dtype=torch.float32)
+                    )
+                    for dst_id, edges in species_edges.items()
+                })
+                for src_id, species_edges in homology_edges.items()
+            })
         
         # Training parameters
-        self.learning_rate = learning_rate
         self.min_learning_rate = min_learning_rate
         self.warmup_epochs = warmup_epochs
 
@@ -192,6 +238,14 @@ class CrossSpeciesVAE(pl.LightningModule):
         self.gradient_clip_val = gradient_clip_val
         self.gradient_clip_algorithm = gradient_clip_algorithm
         self.validation_step_outputs = []
+
+        # Add species classifier
+        self.species_classifier = SpeciesClassifier(
+            n_latent=n_latent,
+            n_species=len(species_vocab_sizes)
+        )
+        
+        self.species_weight = species_weight
 
     
     def configure_optimizers(self):
@@ -281,7 +335,8 @@ class CrossSpeciesVAE(pl.LightningModule):
             "val_recon_loss": loss_dict["recon_loss"],
             "val_kl": loss_dict["kl"],
             "val_homology_loss": loss_dict["homology_loss"],
-            # "val_l1_reg": loss_dict["l1_reg"]
+            "val_l1_reg": loss_dict["l1_reg"],
+            "val_species_loss": loss_dict["species_loss"]
         })
         
         return loss_dict["loss"]
@@ -345,18 +400,23 @@ class CrossSpeciesVAE(pl.LightningModule):
             homology_loss = self.compute_homology_loss(predictions, batch)
         
         # Add L1 regularization for gene importance weights
-        # encoder = self.encoders[str(species_id)]
-        # l1_reg = encoder.gene_importance.get_l1_reg()
+        encoder = self.encoders[str(species_id)]
+        l1_reg = encoder.gene_importance.get_l1_reg()
         
         # Use scheduled beta instead of learnable parameter
         current_beta = self.get_current_beta()
         self.current_beta = current_beta  # Store for logging
         
+        # Add species classifier loss
+        species_loss = self.compute_species_loss(encoder_outputs['z'], batch.species_idx)
+        
         # Total loss with scheduled beta
         total_loss = (
-            recon_loss + 
-            current_beta * (kl) +
-            0.1 * homology_loss
+            self.recon_weight * recon_loss + 
+            current_beta * kl +
+            self.homology_weight * homology_loss + 
+            self.l1_weight * l1_reg +
+            self.species_weight * species_loss
         )
         
         # Add L1 regularization to loss dict
@@ -364,7 +424,9 @@ class CrossSpeciesVAE(pl.LightningModule):
             "loss": total_loss,
             "recon_loss": recon_loss,
             "kl": kl,
-            "homology_loss": homology_loss
+            "homology_loss": homology_loss,
+            "l1_reg": l1_reg,
+            "species_loss": species_loss
         }
 
     def training_step(self, batch: SparseExpressionData, batch_idx: int):
@@ -379,29 +441,116 @@ class CrossSpeciesVAE(pl.LightningModule):
         self.log("train_recon_loss", loss_dict["recon_loss"], sync_dist=True)
         self.log("train_kl", loss_dict["kl"], sync_dist=True)
         self.log("train_homology_loss", loss_dict["homology_loss"], sync_dist=True)
+        self.log("train_l1_reg", loss_dict["l1_reg"], sync_dist=True)
         self.log("beta", self.current_beta, sync_dist=True)
+        self.log("train_species_loss", loss_dict["species_loss"], sync_dist=True)
         
         return loss_dict["loss"]
 
-    def compute_homology_loss(self, predictions: Dict[int, torch.Tensor], batch: SparseExpressionData) -> torch.Tensor:
-        # Compute consistency loss between homologous genes
-        homology_loss = 0.0
-        src, dst = self.homology_edges.t()
-        edge_weights = F.softmax(self.homology_scores, dim=0)
+    # def compute_homology_loss(self, predictions: Dict[int, torch.Tensor], batch: SparseExpressionData) -> torch.Tensor:
+    #     current_species_id = batch.species_idx[0].item()
+    #     homology_loss = 0.0
+    #     temperature = 0.1  # Temperature parameter
         
-        for i, (src_gene, dst_gene) in enumerate(zip(src, dst)):
-            src_species = src_gene // self.species_vocab_sizes[0]  # Assuming sorted vocab sizes
-            dst_species = dst_gene // self.species_vocab_sizes[0]
-            
-            if src_species in predictions and dst_species in predictions:
-                src_pred = predictions[src_species][:, src_gene]
-                dst_pred = predictions[dst_species][:, dst_gene]
+    #     for species_id in predictions:
+    #         if species_id == current_species_id:
+    #             continue
                 
-                # MSE between homologous gene predictions
-                gene_loss = F.mse_loss(src_pred, dst_pred)
-                homology_loss += edge_weights[i] * gene_loss
+    #         edges = self.homology_edges[current_species_id][species_id]
+    #         scores = F.softplus(self.homology_scores[str(current_species_id)][str(species_id)])
+            
+    #         src, dst = edges.t()
+    #         src_pred = predictions[current_species_id][:, src]  # [batch_size, n_edges]
+    #         dst_pred = predictions[species_id][:, dst]  # [batch_size, n_edges]
+            
+    #         # Normalize predictions along batch dimension
+    #         src_norm = F.normalize(src_pred, dim=0)  # [batch_size, n_edges]
+    #         dst_norm = F.normalize(dst_pred, dim=0)  # [batch_size, n_edges]
+            
+    #         # Compute positive similarities
+    #         positive_sim = (src_norm * dst_norm).sum(dim=0) / temperature  # [n_edges]
+            
+    #         # Compute negative similarities using other edges as negatives
+    #         # For each edge, use K random other edges as negatives
+    #         K = 100  # number of negative samples per positive pair
+    #         n_edges = len(edges)
+            
+    #         negative_loss = 0.0
+    #         for i in range(0, n_edges, K):
+    #             # Get random negative indices for this batch
+    #             neg_indices = torch.randint(0, n_edges, (K,), device=src_pred.device)
+                
+    #             # Compute similarities with negative samples
+    #             src_anchor = src_norm[:, i:i+1]  # [batch_size, 1]
+    #             dst_negs = dst_norm[:, neg_indices]  # [batch_size, K]
+                
+    #             neg_sim = (src_anchor.transpose(0,1) @ dst_negs).squeeze(0) / temperature  # [K]
+                
+    #             # InfoNCE loss for this positive pair
+    #             pos_term = positive_sim[i]
+    #             neg_term = torch.logsumexp(neg_sim, dim=0)
+    #             pair_loss = -(pos_term - neg_term)
+                
+    #             # Weight by homology score
+    #             negative_loss += pair_loss * scores[i]
+            
+    #         pair_loss = negative_loss / n_edges
+    #         homology_loss += pair_loss
+                    
+    #     return homology_loss / (len(predictions) - 1)
+    
+    def compute_homology_loss(self, predictions: Dict[int, torch.Tensor], batch: SparseExpressionData) -> torch.Tensor:
+        current_species_id = batch.species_idx[0].item()
+        homology_loss = 0.0
         
-        return homology_loss
+        for species_id in predictions:
+            if species_id == current_species_id:
+                continue
+                
+            # Get edges and scores for this species pair
+            edges = self.homology_edges[current_species_id][species_id]
+            scores = F.softplus(self.homology_scores[str(current_species_id)][str(species_id)])
+            
+            src, dst = edges.t()
+            src_pred = predictions[current_species_id][:, src]
+            dst_pred = predictions[species_id][:, dst]
+            
+            # Center the predictions
+            src_centered = src_pred - src_pred.mean(dim=0)
+            dst_centered = dst_pred - dst_pred.mean(dim=0)
+            
+            # Compute correlation
+            covariance = (src_centered * dst_centered).mean(dim=0)
+            src_std = src_centered.std(dim=0)
+            dst_std = dst_centered.std(dim=0)
+            correlation = covariance / (src_std * dst_std + 1e-8)
+            
+            # Weight each edge's contribution by its learnable score
+            edge_loss = (1 - correlation) * scores
+            pair_loss = edge_loss.mean()
+            
+            homology_loss += pair_loss
+        
+        return homology_loss / (len(predictions) - 1)  # Average across species pairs
+
+    def compute_species_loss(self, z: torch.Tensor, species_idx: torch.Tensor) -> torch.Tensor:
+        """Compute maximum entropy loss for species prediction."""
+        species_logits = self.species_classifier(z.detach())  # Detach for classifier training
+        
+        # Apply temperature scaling to make logits more extreme
+        temperature = 10.0
+        species_logits = species_logits * temperature
+        
+        # Compute probabilities
+        log_probs = F.log_softmax(species_logits, dim=1)
+        
+        # Uniform distribution
+        uniform = torch.ones_like(species_logits) / self.n_species
+        
+        # Reverse KL divergence (tends to force more uniform distribution)
+        entropy_loss = torch.sum(uniform * (torch.log(uniform + 1e-8) - log_probs), dim=1).mean()
+        
+        return entropy_loss
 
     
     def forward(self, batch: SparseExpressionData):
