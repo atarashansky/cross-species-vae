@@ -32,22 +32,18 @@ class CrossSpeciesDataset(IterableDataset):
         self.batch_size = batch_size
         self.seed = seed
         
-        # Store species names and create concatenated data
+        # Store species data directly
+        self.species_data = species_data
         self.species_names = list(species_data.keys())
-        self.concatenated_data = self._concatenate_species_data(species_data)
         
         # Create species indices
         self.species_to_idx = {name: idx for idx, name in enumerate(self.species_names)}
-        self.species_indices = {
-            species: np.where(self.concatenated_data.obs["species"] == species)[0]
-            for species in self.species_names
-        }
         
-        # Calculate sampling statistics
-        self.n_cells_per_species = {
-            species: len(indices) for species, indices in self.species_indices.items()
+        # Create indices for each species
+        self.species_indices = {
+            species: np.arange(data.n_obs)
+            for species, data in species_data.items()
         }
-        self.max_cells = max(self.n_cells_per_species.values())
         
         # Initialize sampling state
         self.rng = np.random.RandomState(seed)
@@ -55,31 +51,6 @@ class CrossSpeciesDataset(IterableDataset):
         
         self.worker_id = None
         self.num_workers = None
-
-    def _concatenate_species_data(self, species_data):
-        """Concatenate data from different species in a block-diagonal fashion."""
-        species_list = list(species_data.values())
-        
-        # Block concatenate of X data across species
-        block_diag_X = sp.sparse.block_diag([data.X for data in species_list], format="csr")
-        concat_obs = pd.concat([data.obs for data in species_list])
-        concat_var = pd.concat([data.var for data in species_list])
-        var_names = pd.Index(sum([list(data.var_names) for data in species_list], []))
-        concat_var.index = var_names
-        obs_names = pd.Index(sum([list(data.obs_names) for data in species_list], []))
-        concat_obs.index = obs_names
-
-        uns = {}
-        for data in species_list:
-            uns.update(data.uns)
-
-        concat_adata = ad.AnnData(
-            X=block_diag_X,
-            obs=concat_obs,
-            var=concat_var,
-            uns=uns
-        )
-        return concat_adata
 
     def _init_sampling_state(self):
         """Initialize sampling state for each species."""
@@ -96,44 +67,34 @@ class CrossSpeciesDataset(IterableDataset):
         )[0]
 
     def _get_batch_indices(self):
-        """Get balanced batch of indices across species."""
-        batch_indices = []
-        cells_per_species = self.batch_size // len(self.species_names)
+        """Get batch of indices for current species."""
+        # Instead of balanced sampling, sample from one species
+        species = self.current_species
+        available = self.available_indices[species]
         
-        for species in self.species_names:
-            available = self.available_indices[species]
-            
-            if len(available) >= cells_per_species:
-                # Sample without replacement
-                selected_idx = self.rng.choice(
-                    available, 
-                    cells_per_species, 
-                    replace=False
+        if len(available) >= self.batch_size:
+            selected_idx = self.rng.choice(
+                available, 
+                self.batch_size, 
+                replace=False
+            )
+            self.available_indices[species] = np.setdiff1d(
+                available, 
+                selected_idx
+            )
+        else:
+            selected_idx = available
+            num_missing = self.batch_size - len(selected_idx)
+            selected_idx = np.concatenate([
+                selected_idx,
+                self.rng.choice(
+                    self.species_indices[species], 
+                    num_missing, 
+                    replace=True
                 )
-                self.available_indices[species] = np.setdiff1d(
-                    available, 
-                    selected_idx
-                )
-            else:
-                selected_idx = available
-                num_missing = cells_per_species - len(selected_idx)
-                # Sample with replacement from original indices
-                selected_idx = np.concatenate([
-                    selected_idx,
-                    self.rng.choice(
-                        self.species_indices[species], 
-                        num_missing, 
-                        replace=True
-                    )
-                ])
+            ])
             
-            batch_indices.extend(selected_idx)
-            
-            # Track cells seen from largest dataset
-            if species == self.largest_species:
-                self.seen_largest_dataset.update([i for i in selected_idx])
-        
-        return np.array(batch_indices)
+        return np.array(selected_idx)
 
     def _epoch_finished(self):
         """Check if we've seen all cells from the largest dataset."""
@@ -141,14 +102,21 @@ class CrossSpeciesDataset(IterableDataset):
 
     def _create_sparse_batch(self, indices):
         """Create a SparseExpressionData batch from indices."""
-        batch_data = self.concatenated_data[indices]
+        # Get current species data
+        species = self.current_species
+        species_adata = self.species_data[species]
+        
+        # Get batch data
+        batch_data = species_adata[indices]
         batch_idx, gene_idx = batch_data.X.nonzero()
         values = torch.from_numpy(batch_data.X.data.astype(np.float32))
         gene_idx = torch.from_numpy(gene_idx.astype(np.int32))
         batch_idx = torch.from_numpy(batch_idx.astype(np.int32))
         
-        species_idx = torch.tensor(
-            [self.species_to_idx[s] for s in batch_data.obs["species"]],
+        # Create species_idx tensor of shape [batch_size]
+        species_idx = torch.full(
+            (len(indices),), 
+            self.species_to_idx[species], 
             dtype=torch.int32
         )
         
@@ -156,9 +124,9 @@ class CrossSpeciesDataset(IterableDataset):
             values=values,
             batch_idx=batch_idx,
             gene_idx=gene_idx,
-            species_idx=species_idx,
+            species_idx=species_idx,  # Now shape [batch_size]
             batch_size=len(indices),
-            n_genes=len(self.concatenated_data.var_names),
+            n_genes=species_adata.n_vars,
             n_species=len(self.species_names),
         )
 
@@ -169,33 +137,31 @@ class CrossSpeciesDataset(IterableDataset):
             self.worker_id = worker_info.id
             self.num_workers = worker_info.num_workers
     
+    @property
+    def n_cells_per_species(self):
+        """Number of cells per species."""
+        return {
+            species: len(indices)
+            for species, indices in self.species_indices.items()
+        }
+    
     def __len__(self):
         """Return the number of batches per epoch."""
-        # We sample batch_size cells total, evenly distributed across species
-        cells_per_species = self.batch_size // len(self.species_names)
         # Number of batches needed to see all cells from largest species once
-        cells_in_largest = self.n_cells_per_species[self.largest_species]
-        # Since we sample cells_per_species cells from largest dataset in each batch,
-        # we need cells_in_largest / cells_per_species batches to see all cells once
-        return int(np.ceil(cells_in_largest / cells_per_species))
+        cells_in_largest = max(self.n_cells_per_species.values())
+        return int(np.ceil(cells_in_largest / self.batch_size))
     
     def __iter__(self):
-        """Iterate over batches of data."""
+        """Iterate over species in round-robin fashion."""
         self._initialize_worker_info()
         self._init_sampling_state()
         
         while not self._epoch_finished():
-            indices = self._get_batch_indices()
-            yield self._create_sparse_batch(indices)
-
-    def get_full_dataset_batch(self):
-        """Create a single batch containing all cells in the dataset."""
-        # Get all indices in order
-        all_indices = np.concatenate([
-            self.species_indices[species] for species in self.species_names
-        ])
-        
-        return self._create_sparse_batch(all_indices)
+            # Cycle through species
+            for species in self.species_names:
+                self.current_species = species
+                indices = self._get_batch_indices()
+                yield self._create_sparse_batch(indices)
 
 
 class CrossSpeciesDataModule(pl.LightningDataModule):
@@ -361,18 +327,14 @@ class CrossSpeciesDataModule(pl.LightningDataModule):
             raise RuntimeError("DataModule not set up yet. Call setup() first.")
         return len(self.train_dataset.species_names)
 
-    def get_full_dataset(self):
-        """
-        Get a single batch containing all cells, without any train/val/test splitting.
+    @property
+    def species_vocab_sizes(self) -> Dict[int, int]:
+        """Get vocabulary sizes for each species."""
+        if self.train_dataset is None:
+            raise RuntimeError("DataModule not set up yet. Call setup() first.")
         
-        Returns:
-            SparseExpressionData containing all cells from the dataset
-        """
-        # Load the complete data for each species without splitting
-        full_data = {}
-        for species, data in self.species_data.items():
-            species_adata = self._load_species_data(data)
-            species_adata.obs["species"] = species
-            full_data[species] = species_adata
-        
-        return CrossSpeciesDataset(full_data, batch_size=self.batch_size, seed=self.seed)
+        species_to_idx = self.train_dataset.species_to_idx
+        return {
+            species_to_idx[species]: data.n_vars 
+            for species, data in self.species_data.items()
+        }

@@ -54,11 +54,13 @@ onehot = sp.sparse.coo_matrix((z,(x,y)),shape=(len(ogs_per_gene),len(indexer)))
 graph = onehot.dot(onehot.T)
 
 p1, p2 = graph.nonzero()
+
 scores = graph.data
 filt = scores > 2
 homology_edges = torch.tensor(np.vstack((p1,p2)).T)[filt]
 homology_scores = torch.tensor(scores)[filt]
 
+# First, let the data module setup
 data_module = CrossSpeciesDataModule(
     species_data = {
         "planarian": adata1,
@@ -73,44 +75,45 @@ data_module = CrossSpeciesDataModule(
 )
 data_module.setup()
 
-# Initialize the model
+# Get species vocabulary sizes from data module
+species_vocab_sizes = data_module.species_vocab_sizes
+
+# Initialize the model using data module properties
 model = CrossSpeciesVAE(
-    n_genes=data_module.n_genes,
-    n_species=data_module.n_species,
+    species_vocab_sizes=species_vocab_sizes,
     homology_edges=homology_edges,
     homology_scores=homology_scores,
     n_latent=128,
     hidden_dims=[512, 256, 128],
     dropout_rate=0.1,
-    species_dim=32,
-    l1_lambda=0.01,
     learning_rate=1e-3,
-    num_nodes=1,
-    num_gpus_per_node=1,
-    # gradient_accumulation_steps=1,
-    temperature=1,
+    min_learning_rate=1e-5,
+    warmup_epochs=0.1,
+    init_beta=1.0,
+    min_beta=0.0,
+    max_beta=10.0,
     gradient_clip_val=1.0,
+    gradient_clip_algorithm="norm",
 )
 
 # Initialize the trainer
 trainer = pl.Trainer(
     accelerator="gpu",
-    devices=model.num_gpus_per_node,
-    num_nodes=model.num_nodes,
+    devices=1,
     max_epochs=5,
     precision='16-mixed',
-    accumulate_grad_batches=1,
     gradient_clip_val=model.gradient_clip_val,
     gradient_clip_algorithm="norm",
     log_every_n_steps=10,
     deterministic=True,
     callbacks=[ModelCheckpoint(
         dirpath="checkpoints",
-        filename="scalable_vae-{epoch:02d}-{val_loss:.2f}",
+        filename="crossspecies_vae-{epoch:02d}-{val_loss:.2f}",
         save_top_k=3,
         monitor="val_loss",
         mode="min"
     )],
+    accumulate_grad_batches=len(species_vocab_sizes),  # Number of species
     enable_progress_bar=True,
     fast_dev_run=False,
 )
