@@ -6,80 +6,73 @@ from torch import cuda
 import math
 import torch.nn as nn
 import torch.nn.functional as F
+from pytorch_lightning.callbacks import Callback
 
 from src.dataclasses import SparseExpressionData
-from src.data import CrossSpeciesDataModule
+from src.data import CrossSpeciesInferenceDataset
 
 class GeneImportanceModule(nn.Module):
-    def __init__(self, n_genes: int, n_hidden: int = 256):
+    def __init__(self, n_genes: int, n_hidden: int = 256, dropout: float = 0.2):
         super().__init__()
-        # Global gene importance weights
+        
         self.global_weights = nn.Parameter(torch.ones(n_genes))
-        
-        # Context network - using smaller hidden dimensions
-        self.context_net = nn.Sequential(
-            nn.Linear(n_genes, n_hidden),  # Reduce to smaller dimension first
-            nn.ReLU(),
-            nn.Linear(n_hidden, n_genes),  # Project back to gene space
-            nn.Softplus()
-        )
-        
-        # Initialize global weights near 1
-        nn.init.normal_(self.global_weights, mean=1.0, std=0.1)
-        
+
+        # self.dropout = nn.Dropout(dropout)
+        # self.context_net = nn.Sequential(
+        #     nn.Linear(n_genes, n_hidden),
+        #     nn.LayerNorm(n_hidden),
+        #     nn.ReLU(),
+        #     self.dropout,
+        #     nn.Linear(n_hidden, n_genes),
+        #     nn.Softplus()
+        # )
+    
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Get context-dependent weights
-        context_weights = self.context_net(x)  # [batch_size, n_genes]
-        
-        # Combine global and context weights
-        importance = self.global_weights * context_weights
-        
+        global_weights = F.softplus(self.global_weights)
+        importance = global_weights
         return x * importance
 
-
 class Encoder(nn.Module):
-    """Multi-scale encoder with species-specific and global latent spaces."""
-
     def __init__(
         self,
         n_genes: int,
-        n_species: int,
         n_latent: int,
         hidden_dims: list,
         n_context_hidden: int = 256,
-        species_embedding_dim: int = 32,
         dropout_rate: float = 0.1,
     ):
         super().__init__()
-
+        
         # Gene importance module
         self.gene_importance = GeneImportanceModule(n_genes, n_context_hidden)
         
-        # Species embedding
-        self.species_embedding = nn.Embedding(n_species, species_embedding_dim)
+        # Create encoder layers helper
+        def make_encoder_layers(input_dim, hidden_dims):
+            layers = []
+            dims = [input_dim] + hidden_dims
+            for i in range(len(dims) - 1):
+                layers.extend([
+                    nn.Linear(dims[i], dims[i + 1]),
+                    nn.LayerNorm(dims[i + 1]),
+                    nn.ReLU(),
+                    nn.Dropout(dropout_rate)
+                ])
+            return nn.Sequential(*layers)
         
-        # Single input layer that handles both with/without species embedding
-        self.input_layer = nn.Linear(n_genes + species_embedding_dim, hidden_dims[0])
         
-        # Rest of the encoder
-        layers = []
-        for i in range(len(hidden_dims) - 1):
-            layers.append(nn.Linear(hidden_dims[i], hidden_dims[i + 1]))
-            layers.append(nn.ReLU())
-            layers.append(nn.Dropout(dropout_rate))
-        
-        self.encoder_net = nn.Sequential(*layers)
+        # Shared pathway (no species info)
+        self.encoder = make_encoder_layers(n_genes, hidden_dims)
         self.mu = nn.Linear(hidden_dims[-1], n_latent)
         self.logvar = nn.Linear(hidden_dims[-1], n_latent)
-
-        # TODO: Try different initializations 
-        # e.g. 
-        # nn.init.xavier_normal_(self.mu.weight, gain=1.0)
-        # nn.init.zeros_(self.mu.bias)
-        # nn.init.xavier_normal_(self.logvar.weight, gain=0.1)
-        # nn.init.constant_(self.logvar.bias, -2.0)
         
-    def forward(self, batch: SparseExpressionData, use_species: bool = True) -> torch.Tensor:
+        
+    def reparameterize(self, mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
+        logvar = torch.clamp(logvar, min=-20, max=2)
+        std = torch.exp(0.5 * logvar)
+        eps = torch.randn_like(std)
+        return mu + eps * std if self.training else mu
+        
+    def forward(self, batch: SparseExpressionData) -> Dict[str, torch.Tensor]:
         # Create dense gene expression matrix
         x = torch.zeros(
             batch.batch_size,
@@ -92,32 +85,17 @@ class Encoder(nn.Module):
         # Apply gene importance
         x = self.gene_importance(x)
         
-        if use_species:
-            # Use full input layer with species embedding
-            species_emb = self.species_embedding(batch.species_idx)
-            x = torch.cat([x, species_emb], dim=1)
-            h = self.input_layer(x)
-        else:
-            # Use only the gene expression part of input layer weights
-            h = F.linear(
-                x, 
-                self.input_layer.weight[:, :batch.n_genes],  # Only use gene weights
-                self.input_layer.bias
-            )
-        
-        # Continue with rest of encoder
-        h = self.encoder_net(h)
+        h = self.encoder(x)
         mu = self.mu(h)
         logvar = self.logvar(h)
-        
-        if self.training:
-            std = torch.exp(0.5 * logvar)
-            eps = torch.randn_like(std)
-            z = mu + eps * std
-        else:
-            z = mu
-            
-        return z, mu, logvar
+        z = self.reparameterize(mu, logvar)
+
+        return {
+            'z': z,
+            'mu': mu,
+            'logvar': logvar
+        }
+   
 
 class Decoder(nn.Module):
     def __init__(
@@ -129,34 +107,22 @@ class Decoder(nn.Module):
     ):
         super().__init__()
         
-        # Decoder layers
+        # Create decoder layers
         layers = []
+        dims = [n_latent] + hidden_dims + [n_genes]
         
-        # Input layer
-        layers.append(nn.Linear(n_latent, hidden_dims[0]))
-        layers.append(nn.ReLU())
-        layers.append(nn.Dropout(dropout_rate))
-        
-        # Hidden layers
-        for i in range(len(hidden_dims) - 1):
-            layers.append(nn.Linear(hidden_dims[i], hidden_dims[i + 1]))
-            layers.append(nn.ReLU())
-            layers.append(nn.Dropout(dropout_rate))
+        for i in range(len(dims) - 1):
+            layers.extend([
+                nn.Linear(dims[i], dims[i + 1]),
+                nn.LayerNorm(dims[i + 1]) if i < len(dims) - 2 else nn.Identity(),
+                nn.ReLU() if i < len(dims) - 2 else nn.Softplus(),
+                nn.Dropout(dropout_rate) if i < len(dims) - 2 else nn.Identity()
+            ])
             
-        # Output layer
-        layers.append(nn.Linear(hidden_dims[-1], n_genes))
-        
         self.decoder_net = nn.Sequential(*layers)
-        
-        # Separate activation for non-negative output
-        self.activation = nn.Softplus()
     
-    def forward(self, z: torch.Tensor) -> torch.Tensor:
-        # Decode
-        h = self.decoder_net(z)
-        
-        # Apply activation for non-negative output
-        return self.activation(h)
+    def forward(self, z: Dict[str, torch.Tensor]) -> torch.Tensor:        
+        return self.decoder_net(z['z'])
 
 
 class CrossSpeciesVAE(pl.LightningModule):
@@ -165,58 +131,57 @@ class CrossSpeciesVAE(pl.LightningModule):
     def __init__(
         self,
         species_vocab_sizes: Dict[int, int],
-        homology_edges: torch.Tensor,
-        homology_scores: torch.Tensor,
+        homology_edges: torch.Tensor | None = None,
+        homology_scores: torch.Tensor | None = None,
         n_latent: int = 32,
         hidden_dims: list = [512, 256, 128],
         dropout_rate: float = 0.1,
         learning_rate: float = 1e-3,
         min_learning_rate: float = 1e-5,
         warmup_epochs: float = 0.1,
-        init_beta: float = 1.0,  # Initial KL weight
-        min_beta: float = 0.0,   # Minimum beta value
-        max_beta: float = 10.0,  # Maximum beta value
+        init_beta: float = 1e-3,  # Initial beta value
+        final_beta: float = 1.0,  # Final beta value
         gradient_clip_val: float = 1.0,
         gradient_clip_algorithm: str = "norm",
     ):
         super().__init__()
         self.save_hyperparameters()
         
-        # Make beta a learnable parameter
-        self.log_beta = nn.Parameter(torch.log(torch.tensor(init_beta)))
-        self.min_beta = min_beta
-        self.max_beta = max_beta
+        # Remove learnable beta parameter
+        self.init_beta = init_beta
+        self.final_beta = final_beta
+        self.current_beta = init_beta  # Track current beta value
         
         # Store parameters
         self.species_vocab_sizes = species_vocab_sizes
         self.n_species = len(species_vocab_sizes)
         self.n_latent = n_latent
-        
+
         # Create species-specific encoders/decoders
         self.encoders = nn.ModuleDict({
             str(species_id): Encoder(
-                n_species=self.n_species,
                 n_genes=vocab_size,
                 n_latent=n_latent,
                 hidden_dims=hidden_dims,
-                dropout_rate=dropout_rate,
+                dropout_rate=dropout_rate
             )
             for species_id, vocab_size in species_vocab_sizes.items()
         })
-        
+    
         self.decoders = nn.ModuleDict({
             str(species_id): Decoder(
                 n_genes=vocab_size,
                 n_latent=n_latent,
-                hidden_dims=hidden_dims[::-1],
+                hidden_dims=hidden_dims[::-1],  # Reverse hidden dims for decoder
                 dropout_rate=dropout_rate,
             )
             for species_id, vocab_size in species_vocab_sizes.items()
         })
-        
+
         # Register homology information
-        self.register_buffer("homology_edges", homology_edges)
-        self.homology_scores = nn.Parameter(homology_scores.float())
+        if homology_edges is not None and homology_scores is not None:
+            self.register_buffer("homology_edges", homology_edges)
+            self.homology_scores = nn.Parameter(homology_scores.float())
         
         # Training parameters
         self.learning_rate = learning_rate
@@ -289,20 +254,34 @@ class CrossSpeciesVAE(pl.LightningModule):
             gradient_clip_algorithm=gradient_clip_algorithm,
         )
 
+    def get_current_beta(self) -> float:
+        """Calculate current beta value based on training progress"""
+        if self.trainer is None:
+            return self.init_beta
+            
+        # Get current epoch and total epochs
+        current_epoch = self.trainer.current_epoch
+        max_epochs = self.trainer.max_epochs
+        
+        # Linear warmup from init_beta to final_beta
+        beta = self.init_beta + (self.final_beta - self.init_beta) * (current_epoch / max_epochs)
+        return beta
+    
     def validation_step(self, batch: SparseExpressionData, batch_idx: int):
         """Validation step."""
         # Forward pass
-        predictions, mu, logvar = self(batch)
+        predictions, encoder_outputs = self(batch)
         
         # Compute losses
-        loss_dict = self.compute_loss(batch, predictions, mu, logvar)
+        loss_dict = self.compute_loss(batch, predictions, encoder_outputs)
         
         # Store for epoch end processing
         self.validation_step_outputs.append({
             "val_loss": loss_dict["loss"],
             "val_recon_loss": loss_dict["recon_loss"],
-            "val_kl_loss": loss_dict["kl_loss"],
+            "val_kl": loss_dict["kl"],
             "val_homology_loss": loss_dict["homology_loss"],
+            # "val_l1_reg": loss_dict["l1_reg"]
         })
         
         return loss_dict["loss"]
@@ -332,11 +311,8 @@ class CrossSpeciesVAE(pl.LightningModule):
         self, 
         batch: SparseExpressionData,
         predictions: Dict[int, torch.Tensor],
-        mu: torch.Tensor,
-        logvar: torch.Tensor,
+        encoder_outputs: Dict[str, torch.Tensor],
     ) -> Dict[str, torch.Tensor]:
-        """Compute all loss components."""
-        
         # Get species ID for this batch
         species_id = batch.species_idx[0].item()
         
@@ -352,44 +328,58 @@ class CrossSpeciesVAE(pl.LightningModule):
         # 1. Reconstruction loss (Poisson NLL)
         recon_loss = F.poisson_nll_loss(
             predictions[species_id].clamp(min=1e-6),
-            target,  # Use dense tensor
+            target,
             log_input=False,
             full=True,
             reduction="mean"
         )
         
-        # 2. KL divergence
-        kl_loss = -0.5 * torch.mean(
-            1 + logvar - mu.pow(2) - logvar.exp()
+        kl = -0.5 * torch.mean(
+            1 + encoder_outputs['logvar'] - 
+            encoder_outputs['mu'].pow(2).clamp(max=100) - 
+            encoder_outputs['logvar'].exp().clamp(max=100)
+        )        
+        
+        homology_loss = torch.tensor(0.0, device=kl.device)
+        if hasattr(self, "homology_edges") and hasattr(self, "homology_scores"):
+            homology_loss = self.compute_homology_loss(predictions, batch)
+        
+        # Add L1 regularization for gene importance weights
+        # encoder = self.encoders[str(species_id)]
+        # l1_reg = encoder.gene_importance.get_l1_reg()
+        
+        # Use scheduled beta instead of learnable parameter
+        current_beta = self.get_current_beta()
+        self.current_beta = current_beta  # Store for logging
+        
+        # Total loss with scheduled beta
+        total_loss = (
+            recon_loss + 
+            current_beta * (kl) +
+            0.1 * homology_loss
         )
         
-        # 3. Homology consistency loss
-        homology_loss = self.compute_homology_loss(predictions, batch)
-        
-        # 4. Total loss with learned beta
-        total_loss = recon_loss + self.beta * kl_loss + homology_loss
-        
+        # Add L1 regularization to loss dict
         return {
             "loss": total_loss,
             "recon_loss": recon_loss,
-            "kl_loss": kl_loss,
-            "homology_loss": homology_loss,
+            "kl": kl,
+            "homology_loss": homology_loss
         }
 
     def training_step(self, batch: SparseExpressionData, batch_idx: int):
-        """Training step with automatic optimization."""
         # Forward pass
-        predictions, mu, logvar = self(batch)
+        predictions, encoder_outputs = self(batch)
         
         # Compute losses
-        loss_dict = self.compute_loss(batch, predictions, mu, logvar)
+        loss_dict = self.compute_loss(batch, predictions, encoder_outputs)
         
-        # Log metrics
+        # Log metrics including current beta
         self.log("train_loss", loss_dict["loss"], sync_dist=True)
         self.log("train_recon_loss", loss_dict["recon_loss"], sync_dist=True)
-        self.log("train_kl_loss", loss_dict["kl_loss"], sync_dist=True)
+        self.log("train_kl", loss_dict["kl"], sync_dist=True)
         self.log("train_homology_loss", loss_dict["homology_loss"], sync_dist=True)
-        self.log("beta", self.beta, sync_dist=True)
+        self.log("beta", self.current_beta, sync_dist=True)
         
         return loss_dict["loss"]
 
@@ -414,69 +404,57 @@ class CrossSpeciesVAE(pl.LightningModule):
         return homology_loss
 
     
-    def forward(self, batch: SparseExpressionData, use_species: bool = True) -> Tuple[Dict[int, torch.Tensor], torch.Tensor, torch.Tensor]:
+    def forward(self, batch: SparseExpressionData):
         # Get species ID for this batch
         species_id = batch.species_idx[0].item()
         
         # Forward pass through encoder
         encoder = self.encoders[str(species_id)]
-        z, mu, logvar = encoder(batch, use_species=use_species)
+        encoder_outputs = encoder(batch)
         
         # Get predictions for all species
         predictions = {}
         for decoder_species_id in self.decoders:
-            predictions[int(decoder_species_id)] = self.decoders[decoder_species_id](z)
+            predictions[int(decoder_species_id)] = self.decoders[decoder_species_id](encoder_outputs)
         
-        return predictions, mu, logvar
+        return predictions, encoder_outputs
 
     @torch.no_grad()
     def get_latent_embeddings(
         self,
         species_data: Dict[str, Union[str, List[str], ad.AnnData, List[ad.AnnData]]],
-        use_species: bool = False,
         return_species: bool = True,
         batch_size: int = 512,
-        num_workers: int = 4,
-        device: Optional[torch.device] = None
+        device: Optional[torch.device] = "cuda",
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         """
         Get latent embeddings for cells in provided AnnData objects.
         
         Args:
             species_data: Dictionary mapping species names to AnnData objects
-                (same format as CrossSpeciesDataModule input)
-            use_species: Whether to use species information in encoding
             return_species: Whether to return species labels
             batch_size: Batch size for processing
-            num_workers: Number of dataloader workers
             device: Device to use for computation. If None, uses model's device
             
         Returns:
             If return_species:
                 latents: Tensor of shape [n_cells, n_latent]
                 species: Tensor of shape [n_cells] containing species indices
-            Else:
-                latents: Tensor of shape [n_cells, n_latent]
         """
         if device is None:
             device = next(self.parameters()).device
+        elif device is not None:
+            self.to(device)
             
-        # Create data module with no train/val/test split
-        data_module = CrossSpeciesDataModule(
+        dataset = CrossSpeciesInferenceDataset(
             species_data=species_data,
             batch_size=batch_size,
-            num_workers=num_workers,
-            val_split=0.0,
-            test_split=0.0,
-            seed=0,
         )
         
         # Get full dataset
-        data_module.setup()
-        dataset = data_module.train_dataset  # Contains all data since splits are 0
-        
         self.eval()  # Set to evaluation mode
         
+
         all_latents = []
         all_species = []
         
@@ -496,23 +474,63 @@ class CrossSpeciesVAE(pl.LightningModule):
             species_id = batch.species_idx[0].item()
             
             # Get latent embeddings
-            latents, _, _ = self.encoders[str(species_id)](batch, use_species=use_species)
+            encoder_outputs = self.encoders[str(species_id)](batch)    
+            all_latents.append(encoder_outputs['z'].cpu())
             
-            all_latents.append(latents.cpu())
             if return_species:
-                # Get one species label per cell
-                species_per_cell = torch.zeros(batch.batch_size, dtype=torch.long)
-                species_per_cell[:] = species_id
-                all_species.append(species_per_cell)
+                all_species.append(batch.species_idx)
         
         # Concatenate all batches
         latents = torch.cat(all_latents, dim=0)
-        
+
         if return_species:
             species = torch.cat(all_species, dim=0)
             return latents, species
         
         return latents
 
+class DivergenceEarlyStopping(Callback):
+    def __init__(
+        self,
+        monitor: str = 'loss',
+        divergence_threshold: float = 0.05,  # Maximum allowed gap between train/val
+        check_divergence_after: int = 500,  # Start checking after this many steps
+        verbose: bool = True
+    ):
+        super().__init__()
+        self.monitor = monitor
+        self.divergence_threshold = divergence_threshold
+        self.check_divergence_after = check_divergence_after
+        self.verbose = verbose
+        
+    def _check_divergence(self, trainer):
+        # Get current training and validation metrics
+        train_loss = trainer.callback_metrics.get(f'train_{self.monitor}')
+        val_loss = trainer.callback_metrics.get(f'val_{self.monitor}')
+        
+        print(train_loss, val_loss)
+        if train_loss is None or val_loss is None:
+            return False
+            
+        # Convert to float values
+        train_loss = train_loss.item()
+        val_loss = val_loss.item()
+        
+        # Calculate absolute relative gap
+        gap = (val_loss - train_loss) / val_loss
+        
 
-
+        # Check if we're past the initial training period
+        if trainer.global_step < self.check_divergence_after:
+            return False
+        
+        if gap > self.divergence_threshold and self.verbose:
+            print(f"Divergence detected: train_loss={train_loss:.4f}, val_loss={val_loss:.4f}, gap={gap:.4f}")
+            
+        return gap > self.divergence_threshold
+        
+    def on_validation_epoch_end(self, trainer, pl_module):
+        if self._check_divergence(trainer):
+            if self.verbose:
+                print(f"Stopping training due to divergence at epoch {trainer.current_epoch}")
+            trainer.should_stop = True

@@ -147,9 +147,11 @@ class CrossSpeciesDataset(IterableDataset):
     
     def __len__(self):
         """Return the number of batches per epoch."""
-        # Number of batches needed to see all cells from largest species once
+        # Since we cycle through all species in round-robin fashion,
+        # multiply the number of batches by number of species
         cells_in_largest = max(self.n_cells_per_species.values())
-        return int(np.ceil(cells_in_largest / self.batch_size))
+        batches_for_largest = int(np.ceil(cells_in_largest / self.batch_size))
+        return batches_for_largest * len(self.species_names)
     
     def __iter__(self):
         """Iterate over species in round-robin fashion."""
@@ -338,3 +340,71 @@ class CrossSpeciesDataModule(pl.LightningDataModule):
             species_to_idx[species]: data.n_vars 
             for species, data in self.species_data.items()
         }
+
+
+class CrossSpeciesInferenceDataset(IterableDataset):
+    """Dataset for inference that sequentially processes all cells without sampling."""
+    
+    def __init__(
+        self,
+        species_data: Dict[str, ad.AnnData],
+        batch_size: int = 128,
+    ):
+        """
+        Initialize dataset.
+        
+        Args:
+            species_data: Dictionary mapping species names to preprocessed AnnData objects
+            batch_size: Batch size for processing
+        """
+        super().__init__()
+        self.species_data = species_data
+        self.batch_size = batch_size
+        self.species_names = list(species_data.keys())
+        self.species_to_idx = {name: idx for idx, name in enumerate(self.species_names)}
+
+    def _create_sparse_batch(self, species: str, indices: np.ndarray):
+        """Create a SparseExpressionData batch from indices."""
+        species_adata = self.species_data[species]
+        
+        # Get batch data
+        batch_data = species_adata[indices]
+        batch_idx, gene_idx = batch_data.X.nonzero()
+        values = torch.from_numpy(batch_data.X.data.astype(np.float32))
+        gene_idx = torch.from_numpy(gene_idx.astype(np.int32))
+        batch_idx = torch.from_numpy(batch_idx.astype(np.int32))
+        
+        # Create species_idx tensor
+        species_idx = torch.full(
+            (len(indices),), 
+            self.species_to_idx[species], 
+            dtype=torch.int32
+        )
+        
+        return SparseExpressionData(
+            values=values,
+            batch_idx=batch_idx,
+            gene_idx=gene_idx,
+            species_idx=species_idx,
+            batch_size=len(indices),
+            n_genes=species_adata.n_vars,
+            n_species=len(self.species_names),
+        )
+
+    def __iter__(self):
+        """Iterate through all cells in each species sequentially."""
+        for species in self.species_names:
+            n_cells = self.species_data[species].n_obs
+            
+            # Process species in batches
+            for start_idx in range(0, n_cells, self.batch_size):
+                end_idx = min(start_idx + self.batch_size, n_cells)
+                indices = np.arange(start_idx, end_idx)
+                yield self._create_sparse_batch(species, indices)
+
+    def __len__(self):
+        """Return total number of batches across all species."""
+        return sum(
+            int(np.ceil(data.n_obs / self.batch_size))
+            for data in self.species_data.values()
+        )
