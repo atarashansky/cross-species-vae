@@ -49,16 +49,30 @@ class Encoder(nn.Module):
 
         # Species-specific latent projectors
         total_hidden = sum(hidden_dims)
-        self.species_mu = nn.ModuleList(
-            [nn.Linear(total_hidden, n_latent) for _ in range(n_species)]
-        )
-        self.species_var = nn.ModuleList(
-            [nn.Linear(total_hidden, n_latent) for _ in range(n_species)]
-        )
+        self.species_mu = nn.ModuleList()
+        self.species_var = nn.ModuleList()
+        for _ in range(n_species):
+            mu_layer = nn.Linear(total_hidden, n_latent)
+            var_layer = nn.Linear(total_hidden, n_latent)
+            
+            # Initialize species-specific projectors
+            nn.init.xavier_normal_(mu_layer.weight, gain=1.0)
+            nn.init.zeros_(mu_layer.bias)
+            nn.init.xavier_normal_(var_layer.weight, gain=0.1)
+            nn.init.constant_(var_layer.bias, -2.0)
+            
+            self.species_mu.append(mu_layer)
+            self.species_var.append(var_layer)
 
-        # Global latent projectors
+        # Global latent projectors with explicit initialization
         self.global_mu = nn.Linear(total_hidden, n_latent)
         self.global_var = nn.Linear(total_hidden, n_latent)
+        
+        # Initialize global projectors
+        nn.init.xavier_normal_(self.global_mu.weight, gain=1.0)
+        nn.init.zeros_(self.global_mu.bias)
+        nn.init.xavier_normal_(self.global_var.weight, gain=0.1)
+        nn.init.constant_(self.global_var.bias, -2.0)  # Start with smaller variance
 
     def message_passing(
         self,
@@ -119,17 +133,22 @@ class Encoder(nn.Module):
         batch: SparseExpressionData,
         edge_index: torch.Tensor,
         edge_attr: torch.Tensor,
+        use_species: bool = True,
     ) -> EncoderOutput:
         # Map species_idx to match sparse values using batch_idx
         expanded_species_idx = batch.species_idx[batch.batch_idx]
         
         # Get species embeddings and ensure correct shape
-        species_emb = self.species_embedding(expanded_species_idx)
-        x = batch.values.view(-1, 1)
+        if use_species:
+            species_emb = self.species_embedding(expanded_species_idx)
+            x = batch.values.view(-1, 1)
 
-        # Combine expression and species info
-        h = torch.cat([x, species_emb], dim=-1)
-        h = self.input_proj(h)
+            # Combine expression and species info
+            h = torch.cat([x, species_emb], dim=-1)
+            h = self.input_proj(h)
+        else:
+            h = batch.values.view(-1, 1)
+            h = self.input_proj.weight[:, 0].unsqueeze(0) * h  # Use only the expression part of input projection
 
         # Ensure edge_index has correct shape and dtype
         if edge_index.shape[0] != 2:
@@ -164,8 +183,8 @@ class Encoder(nn.Module):
                 z = self.reparameterize(mu, logvar)
                 species_latents[species.item()] = SpeciesLatents(latent=z, species_mask=species_mask, mu=mu, logvar=logvar)
 
-        # Generate global latent distribution (per-batch)
-        # First, aggregate features per batch
+        # Generate global latent distribution (per-cell / batch_idx)
+        # First, aggregate features per cell / batch_idx
         batch_features = torch.zeros(
             batch.batch_size,
             multi_scale.size(1),
@@ -185,7 +204,8 @@ class Encoder(nn.Module):
         global_mu = self.global_mu(batch_features)
         global_var = self.global_var(batch_features)
         global_latent = self.reparameterize(global_mu, global_var)
-        return EncoderOutput(species_latents = species_latents, global_latent = global_latent, global_mu=global_mu, global_logvar = global_var)
+        global_logvar = torch.clamp(global_var, min=-4.0, max=-1.0)
+        return EncoderOutput(species_latents = species_latents, global_latent = global_latent, global_mu=global_mu, global_logvar = global_logvar)
 
 
 class Decoder(nn.Module):
@@ -394,14 +414,16 @@ class CrossSpeciesVAE(pl.LightningModule):
             self.log(f"{step_type}_gpu_memory_increase", memory_increase, prog_bar=True, batch_size=batch_size, sync_dist=True)
 
     def encode(
-        self, batch: SparseExpressionData
+        self, batch: SparseExpressionData,
+        use_species: bool = True,
     ) -> EncoderOutput:
         """Encode batch of data into latent space."""
         # Get species-specific and global latent distributions
         encoded = self.encoder(
             batch,
             edge_index=self.homology_edges,
-            edge_attr=self.homology_scores
+            edge_attr=self.homology_scores,
+            use_species=use_species,
         )
         return encoded
 
@@ -418,7 +440,7 @@ class CrossSpeciesVAE(pl.LightningModule):
     def forward(self, batch: SparseExpressionData) -> torch.Tensor:
         """Forward pass through the model."""
         # Encode
-        encoded = self.encode(batch)
+        encoded = self.encode(batch, use_species=True)
 
         # Decode
         reconstruction = self.decode(encoded, batch)
@@ -547,24 +569,33 @@ class CrossSpeciesVAE(pl.LightningModule):
     def compute_loss(self, batch: SparseExpressionData) -> LossOutput:
         import gc
 
-        # Single forward pass through encoder
         encoded = self.encode(batch)
         reconstruction = self.decode(encoded, batch)
-
-        # Add small epsilon to prevent log(0)
-        reconstruction = torch.clamp(reconstruction, min=1e-6)
         
-        # Ensure target values are non-negative
-        target = torch.clamp(batch.values, min=0)
+        # Aggregate predictions per cell
+        cell_predictions = torch.zeros(
+            batch.batch_size, 
+            self.n_genes,
+            device=reconstruction.device, 
+            dtype=reconstruction.dtype
+        )
+        cell_predictions[batch.batch_idx, batch.gene_idx] = reconstruction
         
-        # Compute Poisson NLL loss with log_input=False since we're already handling positive values
-        recon_loss = F.poisson_nll_loss(
-            reconstruction,
-            target,
+        # Aggregate true values per cell
+        cell_true_values = torch.zeros_like(cell_predictions)
+        cell_true_values[batch.batch_idx, batch.gene_idx] = batch.values
+        
+        # Compute loss without reduction
+        cell_losses = F.poisson_nll_loss(
+            cell_predictions.clamp(min=1e-6),
+            cell_true_values,
             log_input=False,
             full=True,
-            reduction="mean"
+            reduction='none'  # Get per-element losses
         )
+
+        # Average per cell first, then across cells
+        recon_loss = cell_losses.mean(dim=1).mean()  # First average genes, then cells
         
         # KL loss (using already computed distributions)
         kl_loss = 0.0
@@ -585,7 +616,7 @@ class CrossSpeciesVAE(pl.LightningModule):
         homology_loss = self.homology_loss(encoded, batch)
 
         # Total loss
-        total_loss = 0.2 * recon_loss + kl_loss  + 0.2 * homology_loss
+        total_loss = recon_loss + kl_loss  + homology_loss
 
         # Clear any cached tensors
         torch.cuda.empty_cache()
@@ -631,7 +662,6 @@ class CrossSpeciesVAE(pl.LightningModule):
         # Add memory logging at the end of validation step
         self._log_memory_stats("val", batch.batch_size)
 
-        print(step_output)
         return step_output
 
     def on_validation_epoch_end(self) -> None:
@@ -721,7 +751,7 @@ class CrossSpeciesVAE(pl.LightningModule):
             cuda.empty_cache()
 
     @torch.no_grad()
-    def inference(self, batch: SparseExpressionData) -> EncoderOutput:
+    def inference(self, batch: SparseExpressionData, use_species: bool = True) -> EncoderOutput:
         """
         Run inference on a batch of data to get latent representations.
         
@@ -732,6 +762,6 @@ class CrossSpeciesVAE(pl.LightningModule):
             EncoderOutput containing species-specific and global latent representations
         """
         self.eval()  # Set model to evaluation mode
-        encoded = self.encode(batch)
+        encoded = self.encode(batch, use_species=use_species)
         self.train()  # Reset model to training mode
         return encoded

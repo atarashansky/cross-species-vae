@@ -361,21 +361,18 @@ class CrossSpeciesDataModule(pl.LightningDataModule):
             raise RuntimeError("DataModule not set up yet. Call setup() first.")
         return len(self.train_dataset.species_names)
 
-    def get_full_dataset(self, split="train"):
+    def get_full_dataset(self):
         """
-        Get a single batch containing all cells for the specified split.
+        Get a single batch containing all cells, without any train/val/test splitting.
         
-        Args:
-            split: One of "train", "val", or "test"
-            
         Returns:
-            SparseExpressionData containing all cells from the specified split
+            SparseExpressionData containing all cells from the dataset
         """
-        if not hasattr(self, f"{split}_dataset"):
-            raise ValueError(f"Invalid split: {split}. Must be one of: train, val, test")
-            
-        dataset = getattr(self, f"{split}_dataset")
-        if dataset is None:
-            raise RuntimeError(f"Dataset for split '{split}' not set up yet. Call setup() first.")
-            
-        return dataset.get_full_dataset_batch()
+        # Load the complete data for each species without splitting
+        full_data = {}
+        for species, data in self.species_data.items():
+            species_adata = self._load_species_data(data)
+            species_adata.obs["species"] = species
+            full_data[species] = species_adata
+        
+        return CrossSpeciesDataset(full_data, batch_size=self.batch_size, seed=self.seed)

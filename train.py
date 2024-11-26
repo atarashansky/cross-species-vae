@@ -79,7 +79,6 @@ model = CrossSpeciesVAE(
     n_species=data_module.n_species,
     homology_edges=homology_edges,
     homology_scores=homology_scores,
-    batch_size=data_module.batch_size,
     n_latent=128,
     hidden_dims=[512, 256, 128],
     dropout_rate=0.1,
@@ -88,8 +87,8 @@ model = CrossSpeciesVAE(
     learning_rate=1e-3,
     num_nodes=1,
     num_gpus_per_node=1,
-    gradient_accumulation_steps=1,
-    temperature=0.1,
+    # gradient_accumulation_steps=1,
+    temperature=1,
     gradient_clip_val=1.0,
 )
 
@@ -98,7 +97,7 @@ trainer = pl.Trainer(
     accelerator="gpu",
     devices=model.num_gpus_per_node,
     num_nodes=model.num_nodes,
-    max_epochs=10,
+    max_epochs=5,
     precision='16-mixed',
     accumulate_grad_batches=1,
     gradient_clip_val=model.gradient_clip_val,
