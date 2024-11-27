@@ -76,18 +76,23 @@ class Encoder(nn.Module):
         eps = torch.randn_like(std)
         return mu + eps * std if self.training else mu
         
-    def forward(self, batch: SparseExpressionData) -> Dict[str, torch.Tensor]:
-        # Create dense gene expression matrix
-        x = torch.zeros(
-            batch.batch_size,
-            batch.n_genes,
-            device=batch.values.device,
-            dtype=batch.values.dtype
-        )
-        x[batch.batch_idx, batch.gene_idx] = batch.values
+    def forward(self, x: Union[SparseExpressionData, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        # Handle sparse input
+        if isinstance(x, SparseExpressionData):
+            # Create dense gene expression matrix
+            dense_x = torch.zeros(
+                x.batch_size,
+                x.n_genes,
+                device=x.values.device,
+                dtype=x.values.dtype
+            )
+            dense_x[x.batch_idx, x.gene_idx] = x.values
+        else:
+            # Input is already dense
+            dense_x = x
         
         # Apply gene importance
-        x = self.gene_importance(x)
+        x = self.gene_importance(dense_x)
         
         h = self.encoder(x)
         mu = self.mu(h)
@@ -165,9 +170,9 @@ class CrossSpeciesVAE(pl.LightningModule):
         final_beta: float = 0.1,
         gradient_clip_val: float = 1.0,
         gradient_clip_algorithm: str = "norm",
-        species_weight: float = 0.1,
+        species_weight: float = 0.0,
         recon_weight: float = 1.0,
-        homology_weight: float = 0.1,
+        homology_weight: float = 0.0,
         l1_weight: float = 0.0,
     ):
         super().__init__()
@@ -324,17 +329,18 @@ class CrossSpeciesVAE(pl.LightningModule):
     def validation_step(self, batch: SparseExpressionData, batch_idx: int):
         """Validation step."""
         # Forward pass
-        predictions, encoder_outputs = self(batch)
+        outputs = self(batch)
         
         # Compute losses
-        loss_dict = self.compute_loss(batch, predictions, encoder_outputs)
+        loss_dict = self.compute_loss(batch, outputs)
         
         # Store for epoch end processing
         self.validation_step_outputs.append({
             "val_loss": loss_dict["loss"],
-            "val_recon_loss": loss_dict["recon_loss"],
-            "val_kl": loss_dict["kl"],
-            "val_homology_loss": loss_dict["homology_loss"],
+            "val_direct_recon_loss": loss_dict["direct_recon_loss"],
+            "val_cross_species_recon_loss": loss_dict["cross_species_recon_loss"],
+            "val_direct_kl": loss_dict["direct_kl"],
+            "val_cross_species_kl": loss_dict["cross_species_kl"],
             "val_l1_reg": loss_dict["l1_reg"],
             "val_species_loss": loss_dict["species_loss"]
         })
@@ -365,85 +371,114 @@ class CrossSpeciesVAE(pl.LightningModule):
     def compute_loss(
         self, 
         batch: SparseExpressionData,
-        predictions: Dict[int, torch.Tensor],
-        encoder_outputs: Dict[str, torch.Tensor],
+        outputs: Dict[str, Any],
     ) -> Dict[str, torch.Tensor]:
-        # Get species ID for this batch
-        species_id = batch.species_idx[0].item()
+        """
+        Compute all losses for the model:
+        1. Direct reconstruction loss (Input A → Encoder A → Decoder A)
+        2. Cross-species reconstruction losses (Synthetic B/C → Encoder B/C → Decoder A)
+        3. KL divergence losses for all encoders
+        4. Additional regularization (L1, species classifier)
+        """
+        # Get target species info
+        target_species_id = outputs['target_species_id']
+        target_input = outputs['direct']['input']
         
-        # Create dense target tensor
-        target = torch.zeros(
-            batch.batch_size,
-            batch.n_genes,
-            device=batch.values.device,
-            dtype=batch.values.dtype
-        )
-        target[batch.batch_idx, batch.gene_idx] = batch.values
-        
-        # 1. Reconstruction loss (Poisson NLL)
-        recon_loss = F.poisson_nll_loss(
-            predictions[species_id].clamp(min=1e-6),
-            target,
+        # 1. Direct reconstruction loss
+        direct_recon_loss = F.poisson_nll_loss(
+            outputs['direct']['reconstruction'].clamp(min=1e-6),
+            target_input,
             log_input=False,
             full=True,
             reduction="mean"
         )
         
-        kl = -0.5 * torch.mean(
-            1 + encoder_outputs['logvar'] - 
-            encoder_outputs['mu'].pow(2).clamp(max=100) - 
-            encoder_outputs['logvar'].exp().clamp(max=100)
-        )        
+        # 2. Cross-species reconstruction losses
+        cross_species_recon_loss = torch.tensor(0.0, device=target_input.device)
+        if len(outputs['cross_species']) > 0:
+            cross_losses = []
+            for species_outputs in outputs['cross_species'].values():
+                loss = F.poisson_nll_loss(
+                    species_outputs['reconstruction'].clamp(min=1e-6),
+                    target_input,
+                    log_input=False,
+                    full=True,
+                    reduction="mean"
+                )
+                cross_losses.append(loss)
+            cross_species_recon_loss = torch.stack(cross_losses).mean()
         
-        homology_loss = torch.tensor(0.0, device=kl.device)
-        if len(self.encoders) > 1 and hasattr(self, "homology_edges") and hasattr(self, "homology_scores"):
-            homology_loss = self.compute_homology_loss(predictions, batch)
+        # 3. KL divergence losses
+        # Direct KL
+        direct_kl = -0.5 * torch.mean(
+            1 + outputs['direct']['encoder_outputs']['logvar'] - 
+            outputs['direct']['encoder_outputs']['mu'].pow(2).clamp(max=100) - 
+            outputs['direct']['encoder_outputs']['logvar'].exp().clamp(max=100)
+        )
         
-        # Add L1 regularization for gene importance weights
-        encoder = self.encoders[str(species_id)]
+        # Cross-species KL
+        cross_species_kl = torch.tensor(0.0, device=target_input.device)
+        if len(outputs['cross_species']) > 0:
+            kl_losses = []
+            for species_outputs in outputs['cross_species'].values():
+                kl = -0.5 * torch.mean(
+                    1 + species_outputs['encoder_outputs']['logvar'] -
+                    species_outputs['encoder_outputs']['mu'].pow(2).clamp(max=100) -
+                    species_outputs['encoder_outputs']['logvar'].exp().clamp(max=100)
+                )
+                kl_losses.append(kl)
+            cross_species_kl = torch.stack(kl_losses).mean()
+        
+        # 4. Additional regularization
+        # L1 regularization for gene importance
+        encoder = self.encoders[str(target_species_id)]
         l1_reg = encoder.gene_importance.get_l1_reg()
         
-        # Use scheduled beta instead of learnable parameter
+        # Species classifier loss (using all latent representations)
+        species_loss = self.compute_species_loss(
+            outputs['direct']['encoder_outputs']['z'],
+            batch.species_idx
+        )
+        
+        # Get current beta for KL weighting
         current_beta = self.get_current_beta()
-        self.current_beta = current_beta  # Store for logging
+        self.current_beta = current_beta
         
-        # Add species classifier loss
-        species_loss = self.compute_species_loss(encoder_outputs['z'], batch.species_idx)
-        
-        # Total loss with scheduled beta
+        # Combine all losses
         total_loss = (
-            self.recon_weight * recon_loss + 
-            current_beta * kl +
-            self.homology_weight * homology_loss + 
+            self.recon_weight * direct_recon_loss +
+            self.recon_weight * cross_species_recon_loss +
+            current_beta * (direct_kl + cross_species_kl) +
             self.l1_weight * l1_reg +
             self.species_weight * species_loss
         )
         
-        # Add L1 regularization to loss dict
         return {
             "loss": total_loss,
-            "recon_loss": recon_loss,
-            "kl": kl,
-            "homology_loss": homology_loss,
+            "direct_recon_loss": direct_recon_loss,
+            "cross_species_recon_loss": cross_species_recon_loss,
+            "direct_kl": direct_kl,
+            "cross_species_kl": cross_species_kl,
             "l1_reg": l1_reg,
             "species_loss": species_loss
         }
 
     def training_step(self, batch: SparseExpressionData, batch_idx: int):
         # Forward pass
-        predictions, encoder_outputs = self(batch)
+        outputs = self(batch)
         
         # Compute losses
-        loss_dict = self.compute_loss(batch, predictions, encoder_outputs)
+        loss_dict = self.compute_loss(batch, outputs)
         
-        # Log metrics including current beta
+        # Log metrics
         self.log("train_loss", loss_dict["loss"], sync_dist=True)
-        self.log("train_recon_loss", loss_dict["recon_loss"], sync_dist=True)
-        self.log("train_kl", loss_dict["kl"], sync_dist=True)
-        self.log("train_homology_loss", loss_dict["homology_loss"], sync_dist=True)
+        self.log("train_direct_recon_loss", loss_dict["direct_recon_loss"], sync_dist=True)
+        self.log("train_cross_species_recon_loss", loss_dict["cross_species_recon_loss"], sync_dist=True)
+        self.log("train_direct_kl", loss_dict["direct_kl"], sync_dist=True)
+        self.log("train_cross_species_kl", loss_dict["cross_species_kl"], sync_dist=True)
         self.log("train_l1_reg", loss_dict["l1_reg"], sync_dist=True)
-        self.log("beta", self.current_beta, sync_dist=True)
         self.log("train_species_loss", loss_dict["species_loss"], sync_dist=True)
+        self.log("beta", self.current_beta, sync_dist=True)
         
         return loss_dict["loss"]
 
@@ -499,39 +534,39 @@ class CrossSpeciesVAE(pl.LightningModule):
                     
     #     return homology_loss / (len(predictions) - 1)
     
-    def compute_homology_loss(self, predictions: Dict[int, torch.Tensor], batch: SparseExpressionData) -> torch.Tensor:
-        current_species_id = batch.species_idx[0].item()
-        homology_loss = 0.0
+    # def compute_homology_loss(self, predictions: Dict[int, torch.Tensor], batch: SparseExpressionData) -> torch.Tensor:
+    #     current_species_id = batch.species_idx[0].item()
+    #     homology_loss = 0.0
         
-        for species_id in predictions:
-            if species_id == current_species_id:
-                continue
+    #     for species_id in predictions:
+    #         if species_id == current_species_id:
+    #             continue
                 
-            # Get edges and scores for this species pair
-            edges = self.homology_edges[current_species_id][species_id]
-            scores = F.softplus(self.homology_scores[str(current_species_id)][str(species_id)])
+    #         # Get edges and scores for this species pair
+    #         edges = self.homology_edges[current_species_id][species_id]
+    #         scores = F.softplus(self.homology_scores[str(current_species_id)][str(species_id)])
             
-            src, dst = edges.t()
-            src_pred = predictions[current_species_id][:, src]
-            dst_pred = predictions[species_id][:, dst]
+    #         src, dst = edges.t()
+    #         src_pred = predictions[current_species_id][:, src]
+    #         dst_pred = predictions[species_id][:, dst]
             
-            # Center the predictions
-            src_centered = src_pred - src_pred.mean(dim=0)
-            dst_centered = dst_pred - dst_pred.mean(dim=0)
+    #         # Center the predictions
+    #         src_centered = src_pred - src_pred.mean(dim=0)
+    #         dst_centered = dst_pred - dst_pred.mean(dim=0)
             
-            # Compute correlation
-            covariance = (src_centered * dst_centered).mean(dim=0)
-            src_std = src_centered.std(dim=0)
-            dst_std = dst_centered.std(dim=0)
-            correlation = covariance / (src_std * dst_std + 1e-8)
+    #         # Compute correlation
+    #         covariance = (src_centered * dst_centered).mean(dim=0)
+    #         src_std = src_centered.std(dim=0)
+    #         dst_std = dst_centered.std(dim=0)
+    #         correlation = covariance / (src_std * dst_std + 1e-8)
             
-            # Weight each edge's contribution by its learnable score
-            edge_loss = (1 - correlation) * scores
-            pair_loss = edge_loss.mean()
+    #         # Weight each edge's contribution by its learnable score
+    #         edge_loss = (1 - correlation) * scores
+    #         pair_loss = edge_loss.mean()
             
-            homology_loss += pair_loss
+    #         homology_loss += pair_loss
         
-        return homology_loss / (len(predictions) - 1)  # Average across species pairs
+    #     return homology_loss / (len(predictions) - 1)  # Average across species pairs
 
     def compute_species_loss(self, z: torch.Tensor, species_idx: torch.Tensor) -> torch.Tensor:
         """Compute maximum entropy loss for species prediction."""
@@ -554,19 +589,71 @@ class CrossSpeciesVAE(pl.LightningModule):
 
     
     def forward(self, batch: SparseExpressionData):
-        # Get species ID for this batch
-        species_id = batch.species_idx[0].item()
+        """
+        Forward pass that computes:
+        1. Direct reconstruction: Input A → Encoder A → Decoder A
+        2. Cross-species reconstructions: Synthetic B/C → Encoder B/C → Decoder A
         
-        # Forward pass through encoder
-        encoder = self.encoders[str(species_id)]
-        encoder_outputs = encoder(batch)
+        Returns:
+            Dict containing:
+            - direct: Dict with encoder outputs and reconstruction for target species
+            - cross_species: Dict mapping species_id to their encoder outputs and reconstructions
+        """
+        # Get target species ID for this batch
+        target_species_id = batch.species_idx[0].item()
         
-        # Get predictions for all species
-        predictions = {}
-        for decoder_species_id in self.decoders:
-            predictions[int(decoder_species_id)] = self.decoders[decoder_species_id](encoder_outputs)
+        # Create dense target tensor
+        target_input = torch.zeros(
+            batch.batch_size,
+            batch.n_genes,
+            device=batch.values.device,
+            dtype=batch.values.dtype
+        )
+        target_input[batch.batch_idx, batch.gene_idx] = batch.values
         
-        return predictions, encoder_outputs
+        # 1. Direct reconstruction path
+        target_encoder_outputs = self.encoders[str(target_species_id)](batch)
+        target_reconstruction = self.decoders[str(target_species_id)](target_encoder_outputs)
+        
+        # 2. Cross-species reconstructions
+        cross_species_outputs = {}
+        for other_species_id in self.encoders.keys():
+            if str(other_species_id) == str(target_species_id):
+                continue
+            
+            # Transform target input to other species' gene space using homology
+            edges = self.homology_edges[target_species_id][int(other_species_id)]
+            scores = F.softplus(self.homology_scores[str(target_species_id)][str(other_species_id)])
+            
+            synthetic_input = self.transform_expression(
+                batch=batch,
+                edges=edges,
+                scores=scores,
+                src_species=target_species_id,
+                dst_species=int(other_species_id)
+            )
+            
+            # Encode synthetic input with other species' encoder
+            other_encoder_outputs = self.encoders[str(other_species_id)](synthetic_input)
+            
+            # Decode back to target species' gene space
+            cross_species_reconstruction = self.decoders[str(target_species_id)](other_encoder_outputs)
+            
+            cross_species_outputs[int(other_species_id)] = {
+                'synthetic_input': synthetic_input,
+                'encoder_outputs': other_encoder_outputs,
+                'reconstruction': cross_species_reconstruction
+            }
+        
+        return {
+            'direct': {
+                'input': target_input,
+                'encoder_outputs': target_encoder_outputs,
+                'reconstruction': target_reconstruction
+            },
+            'cross_species': cross_species_outputs,
+            'target_species_id': target_species_id
+        }
 
     @torch.no_grad()
     def get_latent_embeddings(
@@ -637,6 +724,37 @@ class CrossSpeciesVAE(pl.LightningModule):
             return latents, species
         
         return latents
+
+    def transform_expression(
+        self,
+        batch: SparseExpressionData,
+        edges: torch.Tensor,  # [n_edges, 2] tensor of (src, dst) indices
+        scores: torch.Tensor,  # [n_edges] tensor of homology scores
+        src_species: int,
+        dst_species: int,
+    ) -> torch.Tensor:
+        # Create dense transformation matrix
+        n_src_genes = self.species_vocab_sizes[src_species]
+        n_dst_genes = self.species_vocab_sizes[dst_species]
+        transform_matrix = torch.zeros(
+            n_dst_genes,
+            n_src_genes,
+            device=batch.values.device
+        )
+        transform_matrix[edges[:, 1], edges[:, 0]] = scores
+        
+        # Create dense input matrix
+        x = torch.zeros(
+            batch.batch_size,
+            n_src_genes,
+            device=batch.values.device,
+            dtype=batch.values.dtype
+        )
+        x[batch.batch_idx, batch.gene_idx] = batch.values
+        
+        # Transform expression data
+        transformed = x @ transform_matrix.t()
+        return transformed
 
 class DivergenceEarlyStopping(Callback):
     def __init__(
