@@ -158,6 +158,7 @@ class CrossSpeciesVAE(pl.LightningModule):
         self,
         species_vocab_sizes: Dict[int, int],
         homology_edges: Dict[int, Dict[int, torch.Tensor]] | None = None,
+        homology_scores: Dict[int, Dict[int, torch.Tensor]] | None = None,
         n_latent: int = 32,
         hidden_dims: list = [512, 256, 128],
         dropout_rate: float = 0.1,
@@ -228,7 +229,7 @@ class CrossSpeciesVAE(pl.LightningModule):
             self.homology_scores = nn.ParameterDict({
                 str(src_id): nn.ParameterDict({
                     str(dst_id): nn.Parameter(
-                        torch.ones(len(edges), dtype=torch.float32)
+                        torch.ones(len(edges), dtype=torch.float32) if homology_scores is None else homology_scores[src_id][dst_id] / homology_scores[src_id][dst_id].max()
                     )
                     for dst_id, edges in species_edges.items()
                 })
@@ -342,7 +343,8 @@ class CrossSpeciesVAE(pl.LightningModule):
             "val_direct_kl": loss_dict["direct_kl"],
             "val_cross_species_kl": loss_dict["cross_species_kl"],
             "val_l1_reg": loss_dict["l1_reg"],
-            "val_species_loss": loss_dict["species_loss"]
+            "val_species_loss": loss_dict["species_loss"],
+            "val_homology_loss": loss_dict["homology_loss"]
         })
         
         return loss_dict["loss"]
@@ -386,7 +388,7 @@ class CrossSpeciesVAE(pl.LightningModule):
         
         # 1. Direct reconstruction loss
         direct_recon_loss = F.poisson_nll_loss(
-            outputs['direct']['reconstruction'].clamp(min=1e-6),
+            outputs['direct']['reconstructions'][target_species_id].clamp(min=1e-6),
             target_input,
             log_input=False,
             full=True,
@@ -444,13 +446,18 @@ class CrossSpeciesVAE(pl.LightningModule):
         current_beta = self.get_current_beta()
         self.current_beta = current_beta
         
+        homology_loss = torch.tensor(0.0, device=target_input.device)
+        if len(outputs['cross_species']) > 0 and self.homology_edges is not None:
+            homology_loss = self.compute_homology_loss(outputs['direct']['reconstructions'], batch)
+            
         # Combine all losses
         total_loss = (
             self.recon_weight * direct_recon_loss +
             self.recon_weight * cross_species_recon_loss +
             current_beta * (direct_kl + cross_species_kl) +
-            self.l1_weight * l1_reg +
-            self.species_weight * species_loss
+            # self.l1_weight * l1_reg +
+            # self.species_weight * species_loss +
+            self.homology_weight * homology_loss
         )
         
         return {
@@ -460,7 +467,8 @@ class CrossSpeciesVAE(pl.LightningModule):
             "direct_kl": direct_kl,
             "cross_species_kl": cross_species_kl,
             "l1_reg": l1_reg,
-            "species_loss": species_loss
+            "species_loss": species_loss,
+            "homology_loss": homology_loss
         }
 
     def training_step(self, batch: SparseExpressionData, batch_idx: int):
@@ -478,95 +486,45 @@ class CrossSpeciesVAE(pl.LightningModule):
         self.log("train_cross_species_kl", loss_dict["cross_species_kl"], sync_dist=True)
         self.log("train_l1_reg", loss_dict["l1_reg"], sync_dist=True)
         self.log("train_species_loss", loss_dict["species_loss"], sync_dist=True)
+        self.log("train_homology_loss", loss_dict["homology_loss"], sync_dist=True)
         self.log("beta", self.current_beta, sync_dist=True)
         
         return loss_dict["loss"]
 
-    # def compute_homology_loss(self, predictions: Dict[int, torch.Tensor], batch: SparseExpressionData) -> torch.Tensor:
-    #     current_species_id = batch.species_idx[0].item()
-    #     homology_loss = 0.0
-    #     temperature = 0.1  # Temperature parameter
-        
-    #     for species_id in predictions:
-    #         if species_id == current_species_id:
-    #             continue
-                
-    #         edges = self.homology_edges[current_species_id][species_id]
-    #         scores = F.softplus(self.homology_scores[str(current_species_id)][str(species_id)])
-            
-    #         src, dst = edges.t()
-    #         src_pred = predictions[current_species_id][:, src]  # [batch_size, n_edges]
-    #         dst_pred = predictions[species_id][:, dst]  # [batch_size, n_edges]
-            
-    #         # Normalize predictions along batch dimension
-    #         src_norm = F.normalize(src_pred, dim=0)  # [batch_size, n_edges]
-    #         dst_norm = F.normalize(dst_pred, dim=0)  # [batch_size, n_edges]
-            
-    #         # Compute positive similarities
-    #         positive_sim = (src_norm * dst_norm).sum(dim=0) / temperature  # [n_edges]
-            
-    #         # Compute negative similarities using other edges as negatives
-    #         # For each edge, use K random other edges as negatives
-    #         K = 100  # number of negative samples per positive pair
-    #         n_edges = len(edges)
-            
-    #         negative_loss = 0.0
-    #         for i in range(0, n_edges, K):
-    #             # Get random negative indices for this batch
-    #             neg_indices = torch.randint(0, n_edges, (K,), device=src_pred.device)
-                
-    #             # Compute similarities with negative samples
-    #             src_anchor = src_norm[:, i:i+1]  # [batch_size, 1]
-    #             dst_negs = dst_norm[:, neg_indices]  # [batch_size, K]
-                
-    #             neg_sim = (src_anchor.transpose(0,1) @ dst_negs).squeeze(0) / temperature  # [K]
-                
-    #             # InfoNCE loss for this positive pair
-    #             pos_term = positive_sim[i]
-    #             neg_term = torch.logsumexp(neg_sim, dim=0)
-    #             pair_loss = -(pos_term - neg_term)
-                
-    #             # Weight by homology score
-    #             negative_loss += pair_loss * scores[i]
-            
-    #         pair_loss = negative_loss / n_edges
-    #         homology_loss += pair_loss
-                    
-    #     return homology_loss / (len(predictions) - 1)
     
-    # def compute_homology_loss(self, predictions: Dict[int, torch.Tensor], batch: SparseExpressionData) -> torch.Tensor:
-    #     current_species_id = batch.species_idx[0].item()
-    #     homology_loss = 0.0
+    def compute_homology_loss(self, predictions: Dict[int, torch.Tensor], batch: SparseExpressionData) -> torch.Tensor:
+        current_species_id = batch.species_idx[0].item()
+        homology_loss = 0.0
+        for species_id in predictions:
+            if species_id == current_species_id:
+                continue
+            
+            # Get edges and scores for this species pair
+            edges = self.homology_edges[current_species_id][species_id]
+            scores = F.softplus(self.homology_scores[str(current_species_id)][str(species_id)])
+            
+            src, dst = edges.t()
+
+            src_pred = predictions[current_species_id][:, src]
+            dst_pred = predictions[species_id][:, dst]
+            
+            # Center the predictions
+            src_centered = src_pred - src_pred.mean(dim=0)
+            dst_centered = dst_pred - dst_pred.mean(dim=0)
+            
+            # Compute correlation
+            covariance = (src_centered * dst_centered).mean(dim=0)
+            src_std = src_centered.std(dim=0)
+            dst_std = dst_centered.std(dim=0)
+            correlation = covariance / (src_std * dst_std + 1e-8)
+            
+            # Weight each edge's contribution by its learnable score
+            edge_loss = (1 - correlation) * scores
+            pair_loss = edge_loss.mean()
+            
+            homology_loss += pair_loss
         
-    #     for species_id in predictions:
-    #         if species_id == current_species_id:
-    #             continue
-                
-    #         # Get edges and scores for this species pair
-    #         edges = self.homology_edges[current_species_id][species_id]
-    #         scores = F.softplus(self.homology_scores[str(current_species_id)][str(species_id)])
-            
-    #         src, dst = edges.t()
-    #         src_pred = predictions[current_species_id][:, src]
-    #         dst_pred = predictions[species_id][:, dst]
-            
-    #         # Center the predictions
-    #         src_centered = src_pred - src_pred.mean(dim=0)
-    #         dst_centered = dst_pred - dst_pred.mean(dim=0)
-            
-    #         # Compute correlation
-    #         covariance = (src_centered * dst_centered).mean(dim=0)
-    #         src_std = src_centered.std(dim=0)
-    #         dst_std = dst_centered.std(dim=0)
-    #         correlation = covariance / (src_std * dst_std + 1e-8)
-            
-    #         # Weight each edge's contribution by its learnable score
-    #         edge_loss = (1 - correlation) * scores
-    #         pair_loss = edge_loss.mean()
-            
-    #         homology_loss += pair_loss
-        
-    #     return homology_loss / (len(predictions) - 1)  # Average across species pairs
+        return homology_loss / (len(predictions) - 1)  # Average across species pairs
 
     def compute_species_loss(self, z: torch.Tensor, species_idx: torch.Tensor) -> torch.Tensor:
         """Compute maximum entropy loss for species prediction."""
@@ -592,11 +550,11 @@ class CrossSpeciesVAE(pl.LightningModule):
         """
         Forward pass that computes:
         1. Direct reconstruction: Input A → Encoder A → Decoder A
-        2. Cross-species reconstructions: Synthetic B/C → Encoder B/C → Decoder A
+        2. Cross-species reconstructions: Synthetic B/C → Encoder B/C → Decoder A/B/C
         
         Returns:
             Dict containing:
-            - direct: Dict with encoder outputs and reconstruction for target species
+            - direct: Dict with encoder outputs and reconstructions for all decoders
             - cross_species: Dict mapping species_id to their encoder outputs and reconstructions
         """
         # Get target species ID for this batch
@@ -613,7 +571,11 @@ class CrossSpeciesVAE(pl.LightningModule):
         
         # 1. Direct reconstruction path
         target_encoder_outputs = self.encoders[str(target_species_id)](batch)
-        target_reconstruction = self.decoders[str(target_species_id)](target_encoder_outputs)
+        
+        # Decode to all species
+        target_reconstructions = {}
+        for decoder_species_id in self.decoders.keys():
+            target_reconstructions[int(decoder_species_id)] = self.decoders[decoder_species_id](target_encoder_outputs)
         
         # 2. Cross-species reconstructions
         cross_species_outputs = {}
@@ -649,7 +611,7 @@ class CrossSpeciesVAE(pl.LightningModule):
             'direct': {
                 'input': target_input,
                 'encoder_outputs': target_encoder_outputs,
-                'reconstruction': target_reconstruction
+                'reconstructions': target_reconstructions
             },
             'cross_species': cross_species_outputs,
             'target_species_id': target_species_id
