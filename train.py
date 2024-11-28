@@ -121,7 +121,7 @@ for src_species, src_id in species_ids.items():
         homology_edges[src_id][dst_id] = edges
         homology_scores[src_id][dst_id] = edge_scores
 
-        batch_size = 32
+batch_size = 32
 
 # First, let the data module setup
 data_module = CrossSpeciesDataModule(
@@ -154,24 +154,23 @@ model = CrossSpeciesVAE(
     base_batch_size=32,
     min_learning_rate=1e-5,
     warmup_epochs=0.1,
-    # species_embedding_dim=32,
+    species_embedding_dim=32,
     init_beta=1e-3,
     final_beta=0.1,
     gradient_clip_val=1.0,
     gradient_clip_algorithm="norm",
     # loss weights
     recon_weight=1.0,
-    homology_weight=1.0,
-    init_cross_species_weight = 1.0,
-    final_cross_species_weight = 1.0,
-    l2_reg_weight = 0.00,
-    stage_transition_epoch = 0.0,     
+    homology_weight=0.0,
+    init_cross_species_weight = 0.0,
+    final_cross_species_weight = 0.0,
+    stage_transition_epoch = 0.0,   
 )
 
 early_stopping = EarlyStopping(
     monitor='val_loss',
     min_delta=0.0,
-    patience=100,
+    patience=20,
     verbose=True,
     mode='min'
 )
@@ -199,9 +198,15 @@ trainer = pl.Trainer(
         monitor="val_loss",
         mode="min"
     ), early_stopping],
-    accumulate_grad_batches=len(species_vocab_sizes),  # Number of species
-    enable_progress_bar=False,
+    accumulate_grad_batches=1, #len(species_vocab_sizes),  # Number of species
+    enable_progress_bar=True,
     fast_dev_run=False,
 )
 
 trainer.fit(model, data_module)
+
+output, s = model.get_latent_embeddings({"planarian": adata1,
+                                         "schisto": adata2,
+                                         "hydra": adata3,
+}, reference_species=0)
+s=s.cpu().numpy()

@@ -38,7 +38,6 @@ class Encoder(nn.Module):
         n_genes: int,
         mu_layer: nn.Linear,
         logvar_layer: nn.Linear,
-        species_embedding: nn.Embedding,
         hidden_dims: list,
         n_context_hidden: int = 128,
         dropout_rate: float = 0.1,
@@ -65,7 +64,6 @@ class Encoder(nn.Module):
         self.encoder = make_encoder_layers(n_genes, hidden_dims)
         self.mu = mu_layer
         self.logvar = logvar_layer
-        self.species_embedding = species_embedding
         
         
     def reparameterize(self, mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
@@ -74,7 +72,7 @@ class Encoder(nn.Module):
         eps = torch.randn_like(std)
         return mu + eps * std if self.training else mu
         
-    def forward(self, x: Union[SparseExpressionData, torch.Tensor], species_idx: torch.Tensor) -> Dict[str, torch.Tensor]:
+    def forward(self, x: Union[SparseExpressionData, torch.Tensor]) -> Dict[str, torch.Tensor]:
         # Handle sparse input
         if isinstance(x, SparseExpressionData):
             dense_x = torch.zeros(
@@ -96,9 +94,6 @@ class Encoder(nn.Module):
         
         # Main encoding
         h = self.encoder(x)
-        species_embedding = self.species_embedding(species_idx)
-        h = torch.cat([h, species_embedding], dim=1)
-
         mu = self.mu(h)
         logvar = self.logvar(h)
         z = self.reparameterize(mu, logvar)
@@ -205,10 +200,9 @@ class CrossSpeciesVAE(pl.LightningModule):
         self.n_species = len(species_vocab_sizes)
         self.n_latent = n_latent
 
-        self.mu_layer = nn.Linear(hidden_dims[-1] + species_embedding_dim, n_latent)
-        self.logvar_layer = nn.Linear(hidden_dims[-1] + species_embedding_dim, n_latent)
+        self.mu_layer = nn.Linear(hidden_dims[-1], n_latent)
+        self.logvar_layer = nn.Linear(hidden_dims[-1], n_latent)
         
-        self.encoder_species_embedding = nn.Embedding(self.n_species, species_embedding_dim)
         self.decoder_species_embedding = nn.Embedding(self.n_species, species_embedding_dim)
         
         # Create species-specific encoders/decoders
@@ -217,7 +211,6 @@ class CrossSpeciesVAE(pl.LightningModule):
                 n_genes=vocab_size,
                 mu_layer=self.mu_layer,
                 logvar_layer=self.logvar_layer,
-                species_embedding=self.encoder_species_embedding,
                 hidden_dims=hidden_dims,
                 dropout_rate=dropout_rate
             )
@@ -371,8 +364,6 @@ class CrossSpeciesVAE(pl.LightningModule):
         """Compute validation metrics at epoch end."""
         if not self.validation_step_outputs:
             return
-
-        breakpoint()
         
         metrics = {
             key: torch.stack([x[key] for x in self.validation_step_outputs]).mean()
@@ -556,47 +547,42 @@ class CrossSpeciesVAE(pl.LightningModule):
         target_input[batch.batch_idx, batch.gene_idx] = batch.values
         
         # 1. Direct reconstruction path
-        target_encoder_outputs = self.encoders[str(target_species_id)](batch, batch.species_idx)
+        target_encoder_outputs = self.encoders[str(target_species_id)](batch)
         
         # Decode to all species
         target_reconstructions = {}
-        for decoder_species_id in self.decoders.keys():
+        for decoder_species_id in [str(target_species_id)]:
             target_reconstructions[int(decoder_species_id)] = self.decoders[decoder_species_id](target_encoder_outputs, batch.species_idx)
         
         # 2. Cross-species reconstructions
         cross_species_outputs = {}
-        for other_species_id in self.encoders.keys():
-            if str(other_species_id) == str(target_species_id):
-                continue
+        # for other_species_id in self.encoders.keys():
+        #     if str(other_species_id) == str(target_species_id):
+        #         continue
             
-            # Transform target input to other species' gene space using homology
-            edges = self.homology_edges[target_species_id][int(other_species_id)]
-            scores = F.softplus(self.homology_scores[str(target_species_id)][str(other_species_id)])
+        #     # Transform target input to other species' gene space using homology
+        #     edges = self.homology_edges[target_species_id][int(other_species_id)]
+        #     scores = F.softplus(self.homology_scores[str(target_species_id)][str(other_species_id)])
             
-            synthetic_input = self.transform_expression(
-                batch=batch,
-                edges=edges,
-                scores=scores,
-                src_species=target_species_id,
-                dst_species=int(other_species_id)
-            )
+        #     synthetic_input = self.transform_expression(
+        #         batch=batch,
+        #         edges=edges,
+        #         scores=scores,
+        #         src_species=target_species_id,
+        #         dst_species=int(other_species_id)
+        #     )
             
-            # Encode synthetic input with other species' encoder
-            other_encoder_outputs = self.encoders[str(other_species_id)](
-                synthetic_input, 
-                torch.full((synthetic_input.shape[0],), 
-                          fill_value=int(other_species_id),  # Convert to int
-                          device=synthetic_input.device)
-            )
+        #     # Encode synthetic input with other species' encoder
+        #     other_encoder_outputs = self.encoders[str(other_species_id)](synthetic_input)
             
-            # Decode back to target species' gene space
-            cross_species_reconstruction = self.decoders[str(target_species_id)](other_encoder_outputs, batch.species_idx)
+        #     # Decode back to target species' gene space
+        #     cross_species_reconstruction = self.decoders[str(target_species_id)](other_encoder_outputs, batch.species_idx)
             
-            cross_species_outputs[int(other_species_id)] = {
-                'synthetic_input': synthetic_input,
-                'encoder_outputs': other_encoder_outputs,
-                'reconstruction': cross_species_reconstruction
-            }
+        #     cross_species_outputs[int(other_species_id)] = {
+        #         'synthetic_input': synthetic_input,
+        #         'encoder_outputs': other_encoder_outputs,
+        #         'reconstruction': cross_species_reconstruction
+        #     }
         
         return {
             'direct': {
@@ -614,7 +600,6 @@ class CrossSpeciesVAE(pl.LightningModule):
         species_data: Dict[str, Union[str, List[str], ad.AnnData, List[ad.AnnData]]],
         return_species: bool = True,
         batch_size: int = 512,
-        reference_species: int | None = None,
         device: Optional[torch.device] = "cuda",
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         """
@@ -663,16 +648,7 @@ class CrossSpeciesVAE(pl.LightningModule):
             # Get species-specific encoder
             species_id = batch.species_idx[0].item()
             
-            # Get latent embeddings
-            if reference_species is not None and reference_species in self.encoders.keys():
-                encoder_outputs = self.encoders[str(reference_species)](
-                    batch, 
-                    torch.full((batch.batch_size,), 
-                              fill_value=int(reference_species),  # Convert to int
-                              device=batch.values.device)
-                )    
-            else:
-                encoder_outputs = self.encoders[str(species_id)](batch, batch.species_idx)   
+            encoder_outputs = self.encoders[str(species_id)](batch)   
 
             all_latents.append(encoder_outputs['z'].cpu())
             
