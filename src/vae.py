@@ -32,16 +32,13 @@ class GeneImportanceModule(nn.Module):
         importance = global_weights * self.context_net(x)
         return x * importance
 
-    def get_l1_reg(self) -> torch.Tensor:
-        """Calculate L1 regularization for gene importance weights."""
-        return torch.mean(torch.abs(F.softplus(self.global_weights)))
-
 class Encoder(nn.Module):
     def __init__(
         self,
         n_genes: int,
         mu_layer: nn.Linear,
         logvar_layer: nn.Linear,
+        species_embedding: nn.Embedding,
         hidden_dims: list,
         n_context_hidden: int = 128,
         dropout_rate: float = 0.1,
@@ -68,6 +65,7 @@ class Encoder(nn.Module):
         self.encoder = make_encoder_layers(n_genes, hidden_dims)
         self.mu = mu_layer
         self.logvar = logvar_layer
+        self.species_embedding = species_embedding
         
         
     def reparameterize(self, mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
@@ -76,7 +74,7 @@ class Encoder(nn.Module):
         eps = torch.randn_like(std)
         return mu + eps * std if self.training else mu
         
-    def forward(self, x: Union[SparseExpressionData, torch.Tensor]) -> Dict[str, torch.Tensor]:
+    def forward(self, x: Union[SparseExpressionData, torch.Tensor], species_idx: torch.Tensor) -> Dict[str, torch.Tensor]:
         # Handle sparse input
         if isinstance(x, SparseExpressionData):
             dense_x = torch.zeros(
@@ -98,6 +96,9 @@ class Encoder(nn.Module):
         
         # Main encoding
         h = self.encoder(x)
+        species_embedding = self.species_embedding(species_idx)
+        h = torch.cat([h, species_embedding], dim=1)
+
         mu = self.mu(h)
         logvar = self.logvar(h)
         z = self.reparameterize(mu, logvar)
@@ -115,6 +116,7 @@ class Decoder(nn.Module):
         self,
         n_genes: int,
         n_latent: int,
+        species_embedding: nn.Embedding,
         hidden_dims: list,
         dropout_rate: float = 0.1,
     ):
@@ -122,13 +124,13 @@ class Decoder(nn.Module):
         
         # Technical scaling network
         self.scaling_net = nn.Sequential(
-            nn.Linear(n_latent, n_genes),
+            nn.Linear(n_latent + species_embedding.embedding_dim, n_genes),
             nn.Softplus()  # Ensure positive scaling
         )
         
         # Biological decoder network
         layers = []
-        dims = [n_latent] + hidden_dims + [n_genes]
+        dims = [n_latent + species_embedding.embedding_dim] + hidden_dims + [n_genes]
         
         for i in range(len(dims) - 1):
             layers.extend([
@@ -138,14 +140,17 @@ class Decoder(nn.Module):
                 nn.Dropout(dropout_rate) if i < len(dims) - 2 else nn.Identity()
             ])
             
+        self.species_embedding = species_embedding
         self.decoder_net = nn.Sequential(*layers)
     
-    def forward(self, z: Dict[str, torch.Tensor]) -> torch.Tensor:
+    def forward(self, z: Dict[str, torch.Tensor], species_idx: torch.Tensor) -> torch.Tensor:
         # Get biological factors
-        bio_factors = self.decoder_net(z['z'])
+        species_embedding = self.species_embedding(species_idx)
+        z_input = torch.cat([z['z'], species_embedding], dim=1)
+        bio_factors = self.decoder_net(z_input)
         
         # Get technical scaling factors
-        scaling_factors = self.scaling_net(z['z'])
+        scaling_factors = self.scaling_net(z_input)
 
         # Combine all factors
         return bio_factors * scaling_factors
@@ -165,6 +170,7 @@ class CrossSpeciesVAE(pl.LightningModule):
         base_batch_size: int = 32,
         batch_size: int | None = None,
         min_learning_rate: float = 1e-5,
+        species_embedding_dim: int = 32,
         warmup_epochs: float = 0.1,
         init_beta: float = 1e-3,
         final_beta: float = 0.1,
@@ -199,8 +205,11 @@ class CrossSpeciesVAE(pl.LightningModule):
         self.n_species = len(species_vocab_sizes)
         self.n_latent = n_latent
 
-        self.mu_layer = nn.Linear(hidden_dims[-1], n_latent)
-        self.logvar_layer = nn.Linear(hidden_dims[-1], n_latent)
+        self.mu_layer = nn.Linear(hidden_dims[-1] + species_embedding_dim, n_latent)
+        self.logvar_layer = nn.Linear(hidden_dims[-1] + species_embedding_dim, n_latent)
+        
+        self.encoder_species_embedding = nn.Embedding(self.n_species, species_embedding_dim)
+        self.decoder_species_embedding = nn.Embedding(self.n_species, species_embedding_dim)
         
         # Create species-specific encoders/decoders
         self.encoders = nn.ModuleDict({
@@ -208,6 +217,7 @@ class CrossSpeciesVAE(pl.LightningModule):
                 n_genes=vocab_size,
                 mu_layer=self.mu_layer,
                 logvar_layer=self.logvar_layer,
+                species_embedding=self.encoder_species_embedding,
                 hidden_dims=hidden_dims,
                 dropout_rate=dropout_rate
             )
@@ -218,6 +228,7 @@ class CrossSpeciesVAE(pl.LightningModule):
             str(species_id): Decoder(
                 n_genes=vocab_size,
                 n_latent=n_latent,
+                species_embedding=self.decoder_species_embedding,
                 hidden_dims=hidden_dims[::-1],  # Reverse hidden dims for decoder
                 dropout_rate=dropout_rate,
             )
@@ -545,12 +556,12 @@ class CrossSpeciesVAE(pl.LightningModule):
         target_input[batch.batch_idx, batch.gene_idx] = batch.values
         
         # 1. Direct reconstruction path
-        target_encoder_outputs = self.encoders[str(target_species_id)](batch)
+        target_encoder_outputs = self.encoders[str(target_species_id)](batch, batch.species_idx)
         
         # Decode to all species
         target_reconstructions = {}
         for decoder_species_id in self.decoders.keys():
-            target_reconstructions[int(decoder_species_id)] = self.decoders[decoder_species_id](target_encoder_outputs)
+            target_reconstructions[int(decoder_species_id)] = self.decoders[decoder_species_id](target_encoder_outputs, batch.species_idx)
         
         # 2. Cross-species reconstructions
         cross_species_outputs = {}
@@ -571,10 +582,15 @@ class CrossSpeciesVAE(pl.LightningModule):
             )
             
             # Encode synthetic input with other species' encoder
-            other_encoder_outputs = self.encoders[str(other_species_id)](synthetic_input)
+            other_encoder_outputs = self.encoders[str(other_species_id)](
+                synthetic_input, 
+                torch.full((synthetic_input.shape[0],), 
+                          fill_value=int(other_species_id),  # Convert to int
+                          device=synthetic_input.device)
+            )
             
             # Decode back to target species' gene space
-            cross_species_reconstruction = self.decoders[str(target_species_id)](other_encoder_outputs)
+            cross_species_reconstruction = self.decoders[str(target_species_id)](other_encoder_outputs, batch.species_idx)
             
             cross_species_outputs[int(other_species_id)] = {
                 'synthetic_input': synthetic_input,
@@ -598,6 +614,7 @@ class CrossSpeciesVAE(pl.LightningModule):
         species_data: Dict[str, Union[str, List[str], ad.AnnData, List[ad.AnnData]]],
         return_species: bool = True,
         batch_size: int = 512,
+        reference_species: int | None = None,
         device: Optional[torch.device] = "cuda",
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         """
@@ -647,7 +664,16 @@ class CrossSpeciesVAE(pl.LightningModule):
             species_id = batch.species_idx[0].item()
             
             # Get latent embeddings
-            encoder_outputs = self.encoders[str(species_id)](batch)    
+            if reference_species is not None and reference_species in self.encoders.keys():
+                encoder_outputs = self.encoders[str(reference_species)](
+                    batch, 
+                    torch.full((batch.batch_size,), 
+                              fill_value=int(reference_species),  # Convert to int
+                              device=batch.values.device)
+                )    
+            else:
+                encoder_outputs = self.encoders[str(species_id)](batch, batch.species_idx)   
+
             all_latents.append(encoder_outputs['z'].cpu())
             
             if return_species:
