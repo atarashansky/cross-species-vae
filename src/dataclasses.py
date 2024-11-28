@@ -14,8 +14,6 @@ class SparseExpressionData:
     batch_size: int  # Number of cells in batch
     n_genes: int  # Total number of genes in vocabulary
     n_species: int  # Total number of species
-    lib_size_mean: torch.Tensor  # [batch_size]
-    lib_size_logvar: torch.Tensor  # [batch_size]
 
 
 @dataclass

@@ -12,24 +12,24 @@ from src.dataclasses import SparseExpressionData
 from src.data import CrossSpeciesInferenceDataset
 
 class GeneImportanceModule(nn.Module):
-    def __init__(self, n_genes: int, n_hidden: int = 256, dropout: float = 0.2):
+    def __init__(self, n_genes: int, n_hidden: int = 128, dropout: float = 0.1):
         super().__init__()
         
         self.global_weights = nn.Parameter(torch.ones(n_genes))
 
-        # self.dropout = nn.Dropout(dropout)
-        # self.context_net = nn.Sequential(
-        #     nn.Linear(n_genes, n_hidden),
-        #     nn.LayerNorm(n_hidden),
-        #     nn.ReLU(),
-        #     self.dropout,
-        #     nn.Linear(n_hidden, n_genes),
-        #     nn.Softplus()
-        # )
+        self.dropout = nn.Dropout(dropout)
+        self.context_net = nn.Sequential(
+            nn.Linear(n_genes, n_hidden),
+            nn.LayerNorm(n_hidden),
+            nn.ReLU(),
+            self.dropout,
+            nn.Linear(n_hidden, n_genes),
+            nn.Softplus()
+        )
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         global_weights = F.softplus(self.global_weights)
-        importance = global_weights
+        importance = global_weights * self.context_net(x)
         return x * importance
 
     def get_l1_reg(self) -> torch.Tensor:
@@ -43,7 +43,7 @@ class Encoder(nn.Module):
         mu_layer: nn.Linear,
         logvar_layer: nn.Linear,
         hidden_dims: list,
-        n_context_hidden: int = 256,
+        n_context_hidden: int = 128,
         dropout_rate: float = 0.1,
     ):
         super().__init__()
@@ -69,8 +69,6 @@ class Encoder(nn.Module):
         self.mu = mu_layer
         self.logvar = logvar_layer
         
-        # self.lib_mu = nn.Linear(hidden_dims[-1], 1)
-        # self.lib_logvar = nn.Linear(hidden_dims[-1], 1)
         
     def reparameterize(self, mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
         logvar = torch.clamp(logvar, min=-20, max=2)
@@ -104,16 +102,11 @@ class Encoder(nn.Module):
         logvar = self.logvar(h)
         z = self.reparameterize(mu, logvar)
         
-        # Library size encoding
-        # lib_mu = self.lib_mu(h)
-        # lib_logvar = self.lib_logvar(h)
         
         return {
             'z': z,
             'mu': mu,
             'logvar': logvar,
-            # 'lib_mu': lib_mu,
-            # 'lib_logvar': lib_logvar,
         }
    
 
@@ -155,7 +148,7 @@ class Decoder(nn.Module):
         scaling_factors = self.scaling_net(z['z'])
 
         # Combine all factors
-        return bio_factors * scaling_factors # * z['lib_mu']
+        return bio_factors * scaling_factors
 
 class CrossSpeciesVAE(pl.LightningModule):
     """Cross-species VAE with multi-scale encoding and species-specific components."""
@@ -182,8 +175,6 @@ class CrossSpeciesVAE(pl.LightningModule):
         init_cross_species_weight: float = 0.0,
         final_cross_species_weight: float = 1.0,
         stage_transition_epoch: float = 0.5, 
-        lib_size_mse_weight: float = 1.0,  # Direct supervision weight
-        lib_size_kl_weight: float = 0.1,   # Distribution regularization weight
     ):
         super().__init__()
         self.save_hyperparameters(ignore=['homology_edges'])
@@ -260,8 +251,6 @@ class CrossSpeciesVAE(pl.LightningModule):
         self.init_cross_species_weight = init_cross_species_weight
         self.final_cross_species_weight = final_cross_species_weight
         self.stage_transition_epoch = stage_transition_epoch
-        self.lib_size_mse_weight = lib_size_mse_weight
-        self.lib_size_kl_weight = lib_size_kl_weight
         
         # Store initial model parameters for L2 regularization
         self.initial_params = None
@@ -363,8 +352,6 @@ class CrossSpeciesVAE(pl.LightningModule):
             "val_direct_kl": loss_dict["direct_kl"],
             "val_cross_species_kl": loss_dict["cross_species_kl"],
             "val_homology_loss": loss_dict["homology_loss"],
-            # "val_lib_kl": loss_dict["lib_kl"],
-            # "val_lib_mse": loss_dict["lib_mse"],
         })
         
         return loss_dict["loss"]
@@ -462,32 +449,6 @@ class CrossSpeciesVAE(pl.LightningModule):
             outputs['direct']['encoder_outputs']['logvar'].exp().clamp(max=100)
         )
         
-        
-        # Library size KL divergence with dataset-level priors
-        # lib_mu = outputs['direct']['encoder_outputs']['lib_mu'].squeeze()
-        # lib_logvar = outputs['direct']['encoder_outputs']['lib_logvar'].squeeze()
-        
-        # # Get real library sizes for this batch (in log space)
-        # real_lib_size = torch.log1p(target_input.sum(dim=1))  # log(1 + lib_size)
-        
-        # # 1. Direct supervision loss in log space
-        # lib_mse = F.mse_loss(lib_mu, real_lib_size)
-        
-        # # 2. KL divergence with dataset-level priors
-        # prior_mu = batch.lib_size_mean.to(lib_mu.device)
-        # prior_logvar = batch.lib_size_logvar.to(lib_mu.device)
-        
-        # lib_kl = 0.5 * torch.mean(
-        #     torch.exp(lib_logvar - prior_logvar) + 
-        #     (lib_mu - prior_mu).pow(2) / torch.exp(prior_logvar) - 
-        #     1 + prior_logvar - lib_logvar
-        # )
-        
-        # lib_loss = (
-        #     self.lib_size_mse_weight * lib_mse + 
-        #     self.lib_size_kl_weight * lib_kl
-        # )
-        
         total_loss = (
             self.recon_weight * direct_recon_loss +
             cross_species_weight * (
@@ -495,7 +456,6 @@ class CrossSpeciesVAE(pl.LightningModule):
                 self.homology_weight * homology_loss
             ) +
             current_beta * (direct_kl + cross_species_weight * cross_species_kl)
-            # + lib_loss
         )
         
         return {
@@ -504,11 +464,8 @@ class CrossSpeciesVAE(pl.LightningModule):
             "cross_species_recon_loss": cross_species_recon_loss,
             "direct_kl": direct_kl,
             "cross_species_kl": cross_species_kl,
-            # "lib_kl": lib_kl,
             "homology_loss": homology_loss,
             "beta": torch.tensor(current_beta, device=target_input.device),
-            # "lib_mse": lib_mse,
-            # "lib_kl": lib_kl,
         }
 
     def training_step(self, batch: SparseExpressionData, batch_idx: int):
@@ -525,8 +482,6 @@ class CrossSpeciesVAE(pl.LightningModule):
         self.log("train_direct_kl", loss_dict["direct_kl"], sync_dist=True)
         self.log("train_cross_species_kl", loss_dict["cross_species_kl"], sync_dist=True)
         self.log("train_homology_loss", loss_dict["homology_loss"], sync_dist=True)
-        # self.log("train_lib_kl", loss_dict["lib_kl"], sync_dist=True)
-        # self.log("train_lib_mse", loss_dict["lib_mse"], sync_dist=True)
         
         return loss_dict["loss"]
 
@@ -686,8 +641,6 @@ class CrossSpeciesVAE(pl.LightningModule):
                 batch_size=batch.batch_size,
                 n_genes=batch.n_genes,
                 n_species=batch.n_species,
-                lib_size_mean=batch.lib_size_mean.to(device),
-                lib_size_logvar=batch.lib_size_logvar.to(device),
             )
             
             # Get species-specific encoder

@@ -52,15 +52,6 @@ class CrossSpeciesDataset(IterableDataset):
         self.worker_id = None
         self.num_workers = None
 
-        # Calculate library size statistics per species
-        self.lib_size_stats = {}
-        for species, adata in species_data.items():
-            # Sum across genes for each cell (already log-transformed)
-            lib_sizes = np.asarray(adata.X.sum(axis=1)).flatten()
-            self.lib_size_stats[species] = {
-                'mean': float(np.mean(lib_sizes)),
-                'var': float(np.var(lib_sizes))
-            }
 
     def _init_sampling_state(self):
         """Initialize sampling state for each species."""
@@ -122,11 +113,7 @@ class CrossSpeciesDataset(IterableDataset):
         gene_idx = torch.from_numpy(gene_idx.astype(np.int32))
         batch_idx = torch.from_numpy(batch_idx.astype(np.int32))
         
-        # Get species-specific library size stats
-        lib_stats = self.lib_size_stats[species]
-        lib_size_mean = torch.full((len(indices),), lib_stats['mean'])
-        lib_size_logvar = torch.full((len(indices),), np.log(lib_stats['var'] + 1e-6))
-        
+
         species_idx = torch.full(
             (len(indices),), 
             self.species_to_idx[species], 
@@ -141,8 +128,6 @@ class CrossSpeciesDataset(IterableDataset):
             batch_size=len(indices),
             n_genes=species_adata.n_vars,
             n_species=len(self.species_names),
-            lib_size_mean=lib_size_mean,
-            lib_size_logvar=lib_size_logvar
         )
 
     def _initialize_worker_info(self):
@@ -377,15 +362,7 @@ class CrossSpeciesInferenceDataset(IterableDataset):
         self.batch_size = batch_size
         self.species_names = list(species_data.keys())
         self.species_to_idx = {name: idx for idx, name in enumerate(self.species_names)}
-        
-        # Calculate library size statistics per species
-        self.lib_size_stats = {}
-        for species, adata in species_data.items():
-            lib_sizes = np.asarray(adata.X.sum(axis=1)).flatten()
-            self.lib_size_stats[species] = {
-                'mean': float(np.mean(lib_sizes)),
-                'var': float(np.var(lib_sizes))
-            }
+
 
     def _create_sparse_batch(self, species: str, indices: np.ndarray):
         """Create a SparseExpressionData batch from indices."""
@@ -405,11 +382,6 @@ class CrossSpeciesInferenceDataset(IterableDataset):
             dtype=torch.int32
         )
         
-        # Get species-specific library size stats
-        lib_stats = self.lib_size_stats[species]
-        lib_size_mean = torch.full((len(indices),), lib_stats['mean'])
-        lib_size_logvar = torch.full((len(indices),), np.log(lib_stats['var'] + 1e-6))
-
         return SparseExpressionData(
             values=values,
             batch_idx=batch_idx,
@@ -418,8 +390,6 @@ class CrossSpeciesInferenceDataset(IterableDataset):
             batch_size=len(indices),
             n_genes=species_adata.n_vars,
             n_species=len(self.species_names),
-            lib_size_mean=lib_size_mean,
-            lib_size_logvar=lib_size_logvar,
         )
 
     def __iter__(self):
