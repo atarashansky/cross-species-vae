@@ -11,6 +11,17 @@ from pytorch_lightning.callbacks import Callback
 from src.dataclasses import SparseExpressionData
 from src.data import CrossSpeciesInferenceDataset
 
+class FrozenEmbeddingLayer(nn.Module):
+    def __init__(self, embedding_weights: torch.Tensor):  # [n_genes, embedding_dim]
+        super().__init__()
+        
+        self.embedding = nn.Linear(embedding_weights.shape[0], embedding_weights.shape[1], bias=False)
+        self.embedding.weight.data = embedding_weights.T  # Transpose for matmul
+        self.embedding.weight.requires_grad = False
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.embedding(x)
+    
 class GeneImportanceModule(nn.Module):
     def __init__(self, n_genes: int, n_hidden: int = 128, dropout: float = 0.1):
         super().__init__()
@@ -39,18 +50,22 @@ class Encoder(nn.Module):
         mu_layer: nn.Linear,
         logvar_layer: nn.Linear,
         hidden_dims: list,
+        gene_embeddings: torch.Tensor,
         n_context_hidden: int = 128,
         dropout_rate: float = 0.1,
     ):
         super().__init__()
         
         self.input_bn = nn.BatchNorm1d(n_genes)
-        self.gene_importance = GeneImportanceModule(n_genes, n_context_hidden)
+        self.gene_importance = GeneImportanceModule(n_genes, n_context_hidden)        
+        self.gene_embeddings = FrozenEmbeddingLayer(gene_embeddings)
         
         # Create encoder layers helper
         def make_encoder_layers(input_dim, hidden_dims):
-            layers = []
-            dims = [input_dim] + hidden_dims
+            
+            layers = [self.gene_embeddings]
+            dims = [self.gene_embeddings.embedding.weight.shape[1]] + hidden_dims
+            
             for i in range(len(dims) - 1):
                 layers.extend([
                     nn.Linear(dims[i], dims[i + 1]),
@@ -90,7 +105,7 @@ class Encoder(nn.Module):
         normalized_x = dense_x / (lib_size + 1e-6)
         
         x = self.input_bn(normalized_x)
-        x = self.gene_importance(x)
+        x = F.softmax(self.gene_importance(x), dim=1)
         
         # Main encoding
         h = self.encoder(x)
@@ -156,6 +171,7 @@ class CrossSpeciesVAE(pl.LightningModule):
     def __init__(
         self,
         species_vocab_sizes: Dict[int, int],
+        gene_embeddings: Dict[int, torch.Tensor],        
         homology_edges: Dict[int, Dict[int, torch.Tensor]] | None = None,
         homology_scores: Dict[int, Dict[int, torch.Tensor]] | None = None,
         n_latent: int = 32,
@@ -211,6 +227,7 @@ class CrossSpeciesVAE(pl.LightningModule):
                 mu_layer=self.mu_layer,
                 logvar_layer=self.logvar_layer,
                 hidden_dims=hidden_dims,
+                gene_embeddings=gene_embeddings[species_id],
                 dropout_rate=dropout_rate
             )
             for species_id, vocab_size in species_vocab_sizes.items()
@@ -332,10 +349,10 @@ class CrossSpeciesVAE(pl.LightningModule):
         loss_dict = self.compute_loss(batch, outputs)
         
         # Log metrics
-        self.log("train_loss", loss_dict["loss"], sync_dist=True)
-        self.log("train_recon", loss_dict["recon"], sync_dist=True)
-        self.log("train_kl", loss_dict["kl"], sync_dist=True)
-        self.log("train_similarity", loss_dict["similarity"], sync_dist=True)
+        self.log("train_loss", loss_dict["loss"].detach(), sync_dist=True)
+        self.log("train_recon", loss_dict["recon"].detach(), sync_dist=True)
+        self.log("train_kl", loss_dict["kl"].detach(), sync_dist=True)
+        self.log("train_similarity", loss_dict["similarity"].detach(), sync_dist=True)
         
         return loss_dict["loss"]
         
@@ -347,12 +364,12 @@ class CrossSpeciesVAE(pl.LightningModule):
         # Compute losses
         loss_dict = self.compute_loss(batch, outputs)
         
-        # Store for epoch end processing
+        # Store only the scalar values, detached from computation graph
         self.validation_step_outputs.append({
-            "val_loss": loss_dict["loss"],
-            "val_recon": loss_dict["recon"],
-            "val_kl": loss_dict["kl"],
-            "val_similarity": loss_dict["similarity"],
+            "val_loss": loss_dict["loss"].detach(),
+            "val_recon": loss_dict["recon"].detach(),
+            "val_kl": loss_dict["kl"].detach(),
+            "val_similarity": loss_dict["similarity"].detach(),
         })
         
         return loss_dict["loss"]
