@@ -52,6 +52,8 @@ class CrossSpeciesDataset(IterableDataset):
         self.worker_id = None
         self.num_workers = None
 
+        self._initialize_worker_info()
+        self._init_sampling_state()
 
     def _init_sampling_state(self):
         """Initialize sampling state for each species."""
@@ -155,8 +157,6 @@ class CrossSpeciesDataset(IterableDataset):
     
     def __iter__(self):
         """Iterate over species in round-robin fashion."""
-        self._initialize_worker_info()
-        self._init_sampling_state()
         
         while not self._epoch_finished():
             # Cycle through species
@@ -177,10 +177,6 @@ class CrossSpeciesDataModule(pl.LightningDataModule):
         val_split: float = 0.1,
         test_split: float = 0.1,
         seed: int = 0,
-        multi_species_mode: bool = False,
-        n_species_per_batch: int = 2,
-        cluster_key: str | None = None,
-        neighbors_per_cell: int = 100,
     ):
         """
         Initialize data module.
@@ -196,10 +192,6 @@ class CrossSpeciesDataModule(pl.LightningDataModule):
             val_split: Fraction of data to use for validation
             test_split: Fraction of data to use for testing
             seed: Random seed for reproducibility
-            multi_species_mode: Flag to enable multi-species mode
-            n_species_per_batch: Number of species per batch in multi-species mode
-            cluster_key: Key for cluster assignments in multi-species mode
-            neighbors_per_cell: Number of neighbors per cell for coverage calculation
         """
         super().__init__()
         self.species_data = species_data
@@ -208,15 +200,6 @@ class CrossSpeciesDataModule(pl.LightningDataModule):
         self.val_split = val_split
         self.test_split = test_split
         self.seed = seed
-        
-        # Multi-species mode parameters
-        self.multi_species_mode = multi_species_mode
-        self.n_species_per_batch = n_species_per_batch
-        self.cluster_key = cluster_key
-        self.neighbors_per_cell = neighbors_per_cell
-        
-        if multi_species_mode and cluster_key is None:
-            raise ValueError("cluster_key must be provided for multi_species_mode")
 
         self.train_dataset = None
         self.val_dataset = None
@@ -288,40 +271,27 @@ class CrossSpeciesDataModule(pl.LightningDataModule):
             val_data[species] = species_adata[val_idx].copy()
             test_data[species] = species_adata[test_idx].copy()
         
-        # Choose dataset class based on mode
-        if self.multi_species_mode:
-            dataset_class = MultiSpeciesDataset
-            dataset_kwargs = {
-                'cluster_key': self.cluster_key,
-                'n_species_per_batch': self.n_species_per_batch,
-                'neighbors_per_cell': self.neighbors_per_cell,
-            }
-        else:
-            dataset_class = CrossSpeciesDataset
-            dataset_kwargs = {}
         
         if stage == "fit" or stage is None:
-            self.train_dataset = dataset_class(
+            self.train_dataset = CrossSpeciesDataset(
                 species_data=train_data,
                 batch_size=self.batch_size,
                 seed=self.seed,
-                **dataset_kwargs
             )
             
-            self.val_dataset = dataset_class(
+            self.val_dataset = CrossSpeciesDataset(
                 species_data=val_data,
                 batch_size=self.batch_size,
                 seed=self.seed,
-                **dataset_kwargs
             )
 
         if stage == "test" or stage is None:
-            self.test_dataset = dataset_class(
+            self.test_dataset = CrossSpeciesDataset(
                 species_data=test_data,
                 batch_size=self.batch_size,
                 seed=self.seed,
-                **dataset_kwargs
             )
+        
 
     def train_dataloader(self):
         """Get training dataloader."""
@@ -442,150 +412,3 @@ class CrossSpeciesInferenceDataset(IterableDataset):
             for data in self.species_data.values()
         )
 
-
-class MultiSpeciesDataset(IterableDataset):
-    def __init__(
-        self,
-        species_data: Dict[str, ad.AnnData],
-        cluster_key: str,  # where cluster assignments are stored
-        batch_size: int = 128,
-        n_species_per_batch: int = 2,
-        seed: int = 0,
-        neighbors_per_cell: int = 100,
-        max_num_steps: int | None = None,
-    ):
-        super().__init__()
-        self.batch_size = batch_size
-        self.n_species_per_batch = n_species_per_batch
-        self.species_data = species_data
-        self.species_names = list(species_data.keys())
-        self.species_to_idx = {name: idx for idx, name in enumerate(self.species_names)}
-        self.rng = np.random.RandomState(seed)
-        
-        # Get cluster info for each species
-        self.species_clusters = {
-            species: set(adata.obs[cluster_key])
-            for species, adata in species_data.items()
-        }
-        
-        # Index cells by cluster for efficient sampling
-        self.cluster_indices = {
-            species: {
-                cluster: np.where(adata.obs[cluster_key] == cluster)[0]
-                for cluster in self.species_clusters[species]
-            }
-            for species, adata in species_data.items()
-        }
-
-        # Calculate max steps if not provided
-        if max_num_steps is None:
-            # Average number of cells across species
-            avg_cells = np.mean([
-                adata.n_obs 
-                for adata in species_data.values()
-            ])
-            
-            # Steps = (avg_cells * neighbors_per_cell) / batch_size
-            self.max_num_steps = int((avg_cells * neighbors_per_cell) / batch_size)
-        else:
-            self.max_num_steps = max_num_steps
-            
-        print(f"Max steps per epoch: {self.max_num_steps}")
-
-
-    def _create_sparse_batch(self, indices):
-        """Create a SparseExpressionData batch from indices."""
-        species = self.current_species
-        species_adata = self.species_data[species]
-        
-        # Get batch data
-        batch_data = species_adata[indices]
-        batch_idx, gene_idx = batch_data.X.nonzero()
-        values = torch.from_numpy(batch_data.X.data.astype(np.float32))
-        gene_idx = torch.from_numpy(gene_idx.astype(np.int32))
-        batch_idx = torch.from_numpy(batch_idx.astype(np.int32))
-        
-
-        species_idx = torch.full(
-            (len(indices),), 
-            self.species_to_idx[species], 
-            dtype=torch.int32
-        )
-        
-        return SparseExpressionData(
-            values=values,
-            batch_idx=batch_idx,
-            gene_idx=gene_idx,
-            species_idx=species_idx,
-            batch_size=len(indices),
-            n_genes=species_adata.n_vars,
-            n_species=len(self.species_names),
-        )
-
-    def __len__(self):
-        return self.max_num_steps
-    
-    def __iter__(self):
-        while True:  # Infinite iterator since we're always resampling
-            # Sample n_species_per_batch different species
-            batch_species = self.rng.choice(
-                self.species_names,
-                size=self.n_species_per_batch,
-                replace=False
-            )
-            
-            # Create batch for each species
-            batch = {}
-            for species in batch_species:
-                # Use diverse sampling instead of pure random sampling
-                indices = self._sample_diverse_batch(species)
-                self.current_species = species  # needed for _create_sparse_batch
-                batch[self.species_to_idx[species]] = self._create_sparse_batch(indices)
-            
-            yield batch
-
-    def _sample_diverse_batch(self, species):
-        """Sample cells ensuring representation from different clusters"""
-        n_clusters = len(self.species_clusters[species])
-        
-        if self.batch_size >= n_clusters:
-            # Original logic for when batch_size >= n_clusters
-            cells_per_cluster = self.batch_size // n_clusters
-            indices = []
-            for cluster in self.species_clusters[species]:
-                cluster_cells = self.rng.choice(
-                    self.cluster_indices[species][cluster],
-                    size=cells_per_cluster,
-                    replace=True
-                )
-                indices.extend(cluster_cells)
-        else:
-            # When batch_size < n_clusters:
-            # 1. Randomly select batch_size clusters
-            # 2. Take one cell from each selected cluster
-            selected_clusters = self.rng.choice(
-                list(self.species_clusters[species]),
-                size=self.batch_size,
-                replace=False
-            )
-            
-            indices = []
-            for cluster in selected_clusters:
-                cell = self.rng.choice(
-                    self.cluster_indices[species][cluster],
-                    size=1,
-                    replace=False
-                )
-                indices.extend(cell)
-        
-        # Fill any remaining slots
-        remaining = self.batch_size - len(indices)
-        if remaining > 0:
-            extra_cells = self.rng.choice(
-                len(self.species_data[species]),
-                size=remaining,
-                replace=True
-            )
-            indices.extend(extra_cells)
-        
-        return np.array(indices)
