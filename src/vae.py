@@ -655,22 +655,22 @@ class CrossSpeciesVAE(pl.LightningModule):
                 data=batch.data.to(device),
                 species_idx=batch.species_idx,
             )
-            
-            # Get species-specific encoder            
-            encoder_outputs = self.encoders[str(batch.species_idx)](batch)   
-            latents = encoder_outputs['z'].cpu()
-
-            concat_latents = [latents]
-            if fusion:
-                for species_id in self.species_vocab_sizes.keys():
-                    if species_id == batch.species_idx:
-                        continue
                     
-                    transformed = self._transform_expression(batch, batch.species_idx, species_id)
-                    transformed_encoder_outputs = self.encoders[str(species_id)](transformed)
-                    concat_latents.append(transformed_encoder_outputs['z'].cpu())
+            if fusion:
+                # Get latents for all species
+                concat_latents = [
+                    self.encoders[str(species_id)](
+                        self._transform_expression(batch, batch.species_idx, species_id) 
+                        if species_id != batch.species_idx 
+                        else batch
+                    )['z'].cpu()
+                    for species_id in self.species_vocab_sizes.keys()
+                ]
+            else:
+                # Get latents only for input species
+                concat_latents = [self.encoders[str(batch.species_idx)](batch)['z'].cpu()]
 
-                latents = torch.cat(concat_latents, dim=1)
+            latents = torch.cat(concat_latents, dim=1)
             all_latents.append(latents)
             
             if return_species:
