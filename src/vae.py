@@ -421,6 +421,8 @@ class CrossSpeciesVAE(pl.LightningModule):
         self.prev_gpu_memory = 0
         if cuda.is_available():
             cuda.empty_cache()
+
+        print(f"Current epoch: {self.trainer.current_epoch}", "Current stage: ", self.get_stage())
         
         
    
@@ -451,7 +453,7 @@ class CrossSpeciesVAE(pl.LightningModule):
 
             # Get edges and scores for this species pair
             edges = self.homology_edges[current_species_id][species_id]
-            scores = F.softplus(self.homology_scores[str(current_species_id)][str(species_id)])
+            scores = torch.sigmoid(self.homology_scores[str(current_species_id)][str(species_id)])
 
             src, dst = edges.t()
             src_pred = all_species_outputs[current_species_id][:, src]
@@ -468,12 +470,8 @@ class CrossSpeciesVAE(pl.LightningModule):
             correlation = covariance / (src_std * dst_std + 1e-8)
 
             alignment_loss = -torch.mean(correlation * scores)
-            
-            scores_norm = scores / (scores.sum() + 1e-8)
-            entropy = -(scores_norm * torch.log(scores_norm + 1e-8)).sum()
-            
-            pair_loss = alignment_loss + 0.1 * entropy
-            homology_loss += pair_loss
+
+            homology_loss += alignment_loss
 
         return self.homology_weight * homology_loss / (len(self.species_vocab_sizes) - 1)
 
@@ -481,7 +479,9 @@ class CrossSpeciesVAE(pl.LightningModule):
         self,
         outputs: Dict[str, Any],
     ) -> Dict[str, torch.Tensor]:
-    
+        if self.get_stage() == "homology_loss":
+            return torch.tensor(0.0, device=self.device)
+        
         reconstruction = outputs['reconstructions']
 
         count_loss_nb = torch.tensor(0.0, device=self.device)
@@ -507,6 +507,9 @@ class CrossSpeciesVAE(pl.LightningModule):
         mu: torch.Tensor,
         logvar: torch.Tensor,
     ) -> torch.Tensor:
+        if self.get_stage() == "homology_loss":
+            return torch.tensor(0.0, device=self.device)
+        
         return -0.5 * torch.mean(1 + logvar - mu.pow(2).clamp(max=100) - logvar.exp().clamp(max=100))
     
     def _single_species_compute_loss(
@@ -546,7 +549,7 @@ class CrossSpeciesVAE(pl.LightningModule):
     ) -> torch.Tensor:
         # Create dense transformation matrix
         edges = self.homology_edges[src_species][dst_species]
-        scores = F.softplus(self.homology_scores[str(src_species)][str(dst_species)])
+        scores = torch.sigmoid(self.homology_scores[str(src_species)][str(dst_species)])
         
         n_src_genes = self.species_vocab_sizes[src_species]
         n_dst_genes = self.species_vocab_sizes[dst_species]
