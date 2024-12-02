@@ -232,11 +232,6 @@ class CrossSpeciesVAE(pl.LightningModule):
         self.gradient_clip_algorithm = gradient_clip_algorithm
         self.validation_step_outputs = []
 
-        self.last_homology_loss = 0.0
-        self.last_recon_loss = 0.0
-        self.last_kl_loss = 0.0
-        
-
 
     def configure_optimizers(self):
         optimizer = torch.optim.AdamW(
@@ -315,14 +310,13 @@ class CrossSpeciesVAE(pl.LightningModule):
         
         # Compute losses
         loss_dict = self.compute_loss(batch, outputs)
-        for key, value in loss_dict.items():
-            log_key = f"train_{key}"
-            if value == 0.0:
-                value = getattr(self, f"last_{key}_loss")
-
-            value_to_log = value.detach() if torch.is_tensor(value) else value
-            self.log(log_key, value_to_log, sync_dist=True)
         
+        # Log metrics
+        self.log("train_loss", loss_dict["loss"].detach(), sync_dist=True)
+        self.log("train_recon", loss_dict["recon"].detach(), sync_dist=True)
+        self.log("train_kl", loss_dict["kl"].detach(), sync_dist=True)
+        self.log("train_homology", loss_dict["homology"].detach(), sync_dist=True)
+
         return loss_dict["loss"]
         
     def validation_step(self, batch: BatchData, batch_idx: int):
@@ -334,16 +328,12 @@ class CrossSpeciesVAE(pl.LightningModule):
         loss_dict = self.compute_loss(batch, outputs)
         
         # Store only the scalar values, detached from computation graph
-        log_loss_dict = {}
-        for key, value in loss_dict.items():
-            log_key = f"val_{key}"
-            if value == 0.0:
-                value = getattr(self, f"last_{key}_loss")
-            # Convert all values to tensors
-            value_to_log = torch.tensor(value, device=self.device) if isinstance(value, float) else value.detach()
-            log_loss_dict[log_key] = value_to_log
-            
-        self.validation_step_outputs.append(log_loss_dict)
+        self.validation_step_outputs.append({
+            "val_loss": loss_dict["loss"].detach(),
+            "val_recon": loss_dict["recon"].detach(),
+            "val_kl": loss_dict["kl"].detach(),
+            "val_homology": loss_dict["homology"].detach(),
+        })
         
         return loss_dict["loss"]
 
@@ -424,9 +414,7 @@ class CrossSpeciesVAE(pl.LightningModule):
 
                 homology_loss += alignment_loss
 
-        loss = self.homology_weight * homology_loss / (len(self.species_vocab_sizes) - 1) / len(self.species_vocab_sizes)
-        self.last_homology_loss = loss
-        return loss
+        return self.homology_weight * homology_loss / (len(self.species_vocab_sizes) - 1)
 
 
     def _compute_reconstruction_loss(
@@ -434,7 +422,7 @@ class CrossSpeciesVAE(pl.LightningModule):
         outputs: Dict[str, Any],
         batch: BatchData,
     ) -> torch.Tensor:
-        if self.get_stage() not in ["direct_recon", "transform_recon"]:
+        if self.get_stage() != "transform_recon":
             return torch.tensor(0.0, device=self.device)
         
         count_loss_nb = torch.tensor(0.0, device=self.device)
@@ -456,15 +444,13 @@ class CrossSpeciesVAE(pl.LightningModule):
                     theta=recon['theta'],
                 )
     
-        loss = self.recon_weight * count_loss_nb * (1 - nonzero_fraction) / self.n_species
-        self.last_recon_loss = loss
-        return loss
+        return self.recon_weight * count_loss_nb * (1 - nonzero_fraction)
     
     def _compute_kl_loss(
         self,
         outputs: Dict[str, Any],
     ) -> torch.Tensor:
-        if self.get_stage() not in ["direct_recon", "transform_recon"]:
+        if self.get_stage() != "transform_recon":
             return torch.tensor(0.0, device=self.device)
         
         kl = torch.tensor(0.0, device=self.device)
@@ -478,9 +464,7 @@ class CrossSpeciesVAE(pl.LightningModule):
                 logvar = enc_output['logvar']
                 kl += -0.5 * torch.mean(1 + logvar - mu.pow(2).clamp(max=100) - logvar.exp().clamp(max=100))
                 
-        loss = kl / self.n_species
-        self.last_kl_loss = loss
-        return loss
+        return kl
     
 
 
