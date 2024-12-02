@@ -105,12 +105,7 @@ class CrossSpeciesDataset(IterableDataset):
         
         # Get batch data
         batch_data = species_adata[indices]
-        species_idx = self.species_to_idx[species]
-        
-        return BatchData(
-            data=torch.from_numpy(batch_data.X.toarray() if sp.sparse.issparse(batch_data.X) else batch_data.X),
-            species_idx=species_idx,
-        )
+        return torch.from_numpy(batch_data.X.toarray() if sp.sparse.issparse(batch_data.X) else batch_data.X)
 
     def _initialize_worker_info(self):
         """Initialize worker information for distributed training."""
@@ -142,11 +137,14 @@ class CrossSpeciesDataset(IterableDataset):
 
         while not self._epoch_finished():
             # Cycle through species
+            data = {}
             for species in self.species_names:
                 self.current_species = species
                 indices = self._get_batch_indices()
-                yield self._create_batch(indices)
-
+                species_idx = self.species_to_idx[species]
+                data[species_idx] = self._create_batch(indices)
+            
+            yield BatchData(data=data)
 
 class CrossSpeciesDataModule(pl.LightningDataModule):
     """PyTorch Lightning data module for cross-species data."""
@@ -353,13 +351,8 @@ class CrossSpeciesInferenceDataset(IterableDataset):
         species_adata = self.species_data[species]
         
         # Get batch data
-        batch_data = species_adata[indices]
-        species_idx = self.species_to_idx[species]
-        
-        return BatchData(
-            data=torch.from_numpy(batch_data.X.toarray() if sp.sparse.issparse(batch_data.X) else batch_data.X),
-            species_idx=species_idx,
-        )
+        batch_data = species_adata[indices]        
+        return torch.from_numpy(batch_data.X.toarray() if sp.sparse.issparse(batch_data.X) else batch_data.X)
 
     def __iter__(self):
         """Iterate through all cells in each species sequentially."""
@@ -370,7 +363,8 @@ class CrossSpeciesInferenceDataset(IterableDataset):
             for start_idx in range(0, n_cells, self.batch_size):
                 end_idx = min(start_idx + self.batch_size, n_cells)
                 indices = np.arange(start_idx, end_idx)
-                yield self._create_batch(species, indices)
+                data = self._create_batch(species, indices)
+                yield BatchData(data={self.species_to_idx[species]: data})
 
     def __len__(self):
         """Return total number of batches across all species."""

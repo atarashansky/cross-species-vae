@@ -75,13 +75,8 @@ class Encoder(nn.Module):
         eps = torch.randn_like(std)
         return mu + eps * std if self.training else mu
         
-    def forward(self, x: BatchData) -> Dict[str, torch.Tensor]:
-        dense_x = x.data
-
-        x = dense_x + self.gene_importance(dense_x)
-
-        # Main encoding
-        h = self.encoder(x)
+    def forward(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
+        h = self.encoder(x + self.gene_importance(x))
         mu = self.mu(h)
         logvar = self.logvar(h)
         z = self.reparameterize(mu, logvar)
@@ -100,39 +95,23 @@ class Decoder(nn.Module):
         n_genes: int,
         n_species: int,
         n_latent: int,
-        species_embedding: nn.Embedding,
+        species_id: int,
         hidden_dims: list,
         dropout_rate: float = 0.1,
     ):
         super().__init__()
         self.log_theta = nn.Parameter(torch.ones(n_genes) * 2.3)
+        self.n_species = n_species
 
         # Technical scaling network
-        self.scaling_net_single = nn.Sequential(
-            nn.Linear(n_latent, n_genes),
-            nn.Sigmoid()
-        )
-
-        self.scaling_net_fusion = nn.Sequential(
+        self.scaling_net = nn.Sequential(
             nn.Linear(n_latent * n_species, n_genes),
             nn.Sigmoid()
         )
-        
-        # Biological decoder network
-        layers = []
-        dims = [n_latent] + hidden_dims + [n_genes]
-        
-        for i in range(len(dims) - 1):
-            layers.extend([
-                nn.Linear(dims[i], dims[i + 1]),
-                nn.LayerNorm(dims[i + 1]) if i < len(dims) - 2 else nn.Identity(),
-                nn.ReLU() if i < len(dims) - 2 else nn.Softplus(),
-                nn.Dropout(dropout_rate) if i < len(dims) - 2 else nn.Identity()
-            ])
-            
-        # self.species_embedding = species_embedding
-        self.decoder_net_single = nn.Sequential(*layers)
 
+        self.species_id = species_id
+
+        # Biological decoder network
         layers = []
         dims = [n_latent * n_species] + hidden_dims + [n_genes]
         
@@ -144,60 +123,35 @@ class Decoder(nn.Module):
                 nn.Dropout(dropout_rate) if i < len(dims) - 2 else nn.Identity()
             ])
             
-        self.decoder_net_fusion = nn.Sequential(*layers)        
+        self.decoder_net = nn.Sequential(*layers)     
     
-    def forward(self, z: Dict[str, torch.Tensor], fusion: bool = False) -> Dict[str, torch.Tensor]:
-        if fusion:
-            return self._fusion_forward(z)
-        else:
-            return self._single_forward(z)
     
-    def _single_forward(self, z: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+    def forward(self, z: Dict[int, torch.Tensor]) -> Dict[str, torch.Tensor]:
         # Get biological factors
-        # batch_species_idx = torch.full((z['z'].shape[0],), species_idx, dtype=torch.long, device=z['z'].device)
-        # species_embedding = self.species_embedding(batch_species_idx)
-        # z_input = torch.cat([z['z'], species_embedding], dim=1)
-        bio_factors = self.decoder_net_single(z['z'])
+        all_latents = [z[self.species_id]]  # Primary species first
+        for species_idx in range(self.n_species):
+            if species_idx != self.species_id:
+                all_latents.append(z[species_idx])
         
-        # Get technical scaling factors
-        scaling_factors = self.scaling_net_single(z['z'])
-
-        # Combine all factors
+        z_concat = torch.cat(all_latents, dim=1)
+        
+        bio_factors = self.decoder_net(z_concat)
+        scaling_factors = self.scaling_net(z_concat)
         mean = bio_factors * scaling_factors
-        theta = torch.exp(self.log_theta)  # Ensure theta is positive
+        theta = torch.exp(self.log_theta)  
         
         return {
             'mean': mean,
             'theta': theta
         }
-
-    def _fusion_forward(self, z: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
-
-        # Get biological factors
-        # batch_species_idx = torch.full((z['z'].shape[0],), species_idx, dtype=torch.long, device=z['z'].device)
-        # # species_embedding = self.species_embedding(batch_species_idx)
-        # z_input = torch.cat([z['z'], species_embedding], dim=1)
-        bio_factors = self.decoder_net_fusion(z['z'])
-        
-        # Get technical scaling factors
-        scaling_factors = self.scaling_net_fusion(z['z'])
-
-        # Combine all factors
-        mean = bio_factors * scaling_factors
-        theta = torch.exp(self.log_theta)  # Ensure theta is positive
-        
-        return {
-            'mean': mean,
-            'theta': theta
-        }        
+    
 
 class CrossSpeciesVAE(pl.LightningModule):
     """Cross-species VAE with multi-scale encoding and species-specific components."""
 
     STAGE_MAPPING = {
-        0: "direct_recon",
-        1: "transform_recon",
-        2: "homology_loss",
+        0: "transform_recon",
+        1: "homology_loss",
     }
 
     def __init__(
@@ -212,14 +166,13 @@ class CrossSpeciesVAE(pl.LightningModule):
         base_batch_size: int = 32,
         batch_size: int | None = None,
         min_learning_rate: float = 1e-5,
-        species_embedding_dim: int = 64,
         warmup_epochs: float = 0.1,
         init_beta: float = 1e-3,
         final_beta: float = 0.1,
         gradient_clip_val: float = 1.0,
         gradient_clip_algorithm: str = "norm",
         recon_weight: float = 1.0,
-        homology_weight: float = 0.1,
+        homology_weight: float = 1.0,
     ):
         super().__init__()
         self.save_hyperparameters(ignore=['homology_edges', 'homology_scores'])
@@ -244,9 +197,7 @@ class CrossSpeciesVAE(pl.LightningModule):
 
         self.mu_layer = nn.Linear(hidden_dims[-1], n_latent)
         self.logvar_layer = nn.Linear(hidden_dims[-1], n_latent)
-        
-        self.decoder_species_embedding = nn.Embedding(self.n_species, species_embedding_dim)
-        
+                
         # Create species-specific encoders/decoders
         self.encoders = nn.ModuleDict({
             str(species_id): Encoder(
@@ -263,8 +214,8 @@ class CrossSpeciesVAE(pl.LightningModule):
             str(species_id): Decoder(
                 n_genes=vocab_size,
                 n_species=self.n_species,
+                species_id=species_id,
                 n_latent=n_latent,
-                species_embedding=self.decoder_species_embedding,
                 hidden_dims=hidden_dims[::-1],  # Reverse hidden dims for decoder
                 dropout_rate=dropout_rate,
             )
@@ -296,7 +247,7 @@ class CrossSpeciesVAE(pl.LightningModule):
         self.validation_step_outputs = []
         
 
-    
+
     def configure_optimizers(self):
         optimizer = torch.optim.AdamW(
             self.parameters(),
@@ -380,7 +331,7 @@ class CrossSpeciesVAE(pl.LightningModule):
         self.log("train_recon", loss_dict["recon"].detach(), sync_dist=True)
         self.log("train_kl", loss_dict["kl"].detach(), sync_dist=True)
         self.log("train_homology", loss_dict["homology"].detach(), sync_dist=True)
-        
+
         return loss_dict["loss"]
         
     def validation_step(self, batch: BatchData, batch_idx: int):
@@ -429,105 +380,118 @@ class CrossSpeciesVAE(pl.LightningModule):
     def _compute_homology_loss(self, outputs: Dict[int, Any], batch: BatchData) -> torch.Tensor:   
         if self.get_stage() != "homology_loss":
             return torch.tensor(0.0, device=self.device)
-                        
-        current_species_id = batch.species_idx
-        homology_loss = 0.0
         
-        # Get encoder outputs for current species
-        encoder_outputs = outputs['encoder_outputs'][current_species_id]
-        reconstructions = outputs['reconstructions'][current_species_id]
-        
-        # Get decoder outputs for all species
-        all_species_outputs = {current_species_id: reconstructions['mean']}
-        for species_id in self.species_vocab_sizes.keys():
-            if species_id == current_species_id:
-                continue
+        assembled_data = {}
+        for target_species_id in outputs:
+            # For each target species, collect real and transformed data
+            data_to_concat = []
             
-            decoder_output = self.decoders[str(species_id)](encoder_outputs, fusion=False)
-            all_species_outputs[species_id] = decoder_output['mean']
-
+            # Add data from each source species (including self)
+            for source_species_id in self.species_vocab_sizes.keys():
+                if source_species_id == target_species_id:
+                    # Use real data for matching species
+                    data_to_concat.append(batch.data[source_species_id])
+                else:
+                    # Use reconstructed data for other species
+                    recon = outputs[source_species_id]['reconstructions'][target_species_id]
+                    data_to_concat.append(recon['mean'])
+            
+            # Concatenate all data for this target species space
+            assembled_data[target_species_id] = torch.cat(data_to_concat, dim=0)
+        
+        homology_loss = torch.tensor(0.0, device=self.device)
+        
         # Compute homology loss across species pairs
-        for species_id in self.species_vocab_sizes.keys():
-            if species_id == current_species_id:
-                continue
+        for src_species_id in assembled_data:
+            for dst_species_id in assembled_data:
+                if src_species_id == dst_species_id:
+                    continue
+                
+                # Get edges and scores for this species pair
+                edges = self.homology_edges[src_species_id][dst_species_id]
+                scores = torch.sigmoid(self.homology_scores[str(src_species_id)][str(dst_species_id)])
 
-            # Get edges and scores for this species pair
-            edges = self.homology_edges[current_species_id][species_id]
-            scores = torch.sigmoid(self.homology_scores[str(current_species_id)][str(species_id)])
+                src, dst = edges.t()
+                src_pred = assembled_data[src_species_id][:, src]
+                dst_pred = assembled_data[dst_species_id][:, dst]
 
-            src, dst = edges.t()
-            src_pred = all_species_outputs[current_species_id][:, src]
-            dst_pred = all_species_outputs[species_id][:, dst]
+                # Center the predictions
+                src_centered = src_pred - src_pred.mean(dim=0)
+                dst_centered = dst_pred - dst_pred.mean(dim=0)
 
-            # Center the predictions
-            src_centered = src_pred - src_pred.mean(dim=0)
-            dst_centered = dst_pred - dst_pred.mean(dim=0)
+                # Compute correlation
+                covariance = (src_centered * dst_centered).mean(dim=0)
+                src_std = src_centered.std(dim=0)
+                dst_std = dst_centered.std(dim=0)
+                correlation = covariance / (src_std * dst_std + 1e-8)
 
-            # Compute correlation
-            covariance = (src_centered * dst_centered).mean(dim=0)
-            src_std = src_centered.std(dim=0)
-            dst_std = dst_centered.std(dim=0)
-            correlation = covariance / (src_std * dst_std + 1e-8)
+                alignment_loss = -torch.mean(correlation * scores)
 
-            alignment_loss = -torch.mean(correlation * scores)
-
-            homology_loss += alignment_loss
+                homology_loss += alignment_loss
 
         return self.homology_weight * homology_loss / (len(self.species_vocab_sizes) - 1)
 
     def _compute_reconstruction_loss(
         self,
+        batch: BatchData,
         outputs: Dict[str, Any],
-    ) -> Dict[str, torch.Tensor]:
-        if self.get_stage() == "homology_loss":
+    ) -> torch.Tensor:
+        if self.get_stage() != "transform_recon":
             return torch.tensor(0.0, device=self.device)
         
-        reconstruction = outputs['reconstructions']
-
         count_loss_nb = torch.tensor(0.0, device=self.device)
-        for species_id, input in outputs['inputs'].items():
-            
-            target_counts = torch.exp(input) - 1
-            pred_counts = torch.exp(reconstruction[species_id]['mean']) - 1
-            nonzero_fraction = (target_counts > 0).float().mean()
+        for target_species_id in outputs:
+            target_counts = torch.exp(batch.data[target_species_id]) - 1
+            nonzero_fraction = (target_counts > 0).float().mean()        
+            target_norm = target_counts / target_counts.sum(dim=1, keepdim=True) * 10_000  
 
-            target_norm = target_counts / target_counts.sum(dim=1, keepdim=True) * 10_000
-            pred_norm = pred_counts / pred_counts.sum(dim=1, keepdim=True) * 10_000
-            
-            count_loss_nb += negative_binomial_loss(
-                pred=pred_norm.clamp(min=1e-6),
-                target=target_norm,
-                theta=reconstruction[species_id]['theta'],
-            )
+            reconstructions = outputs[target_species_id]['reconstructions']
+
+            for species_id, recon in reconstructions.items():
+                pred_counts = torch.exp(recon['mean']) - 1
+                pred_norm = pred_counts / pred_counts.sum(dim=1, keepdim=True) * 10_000            
+                
+                count_loss_nb += negative_binomial_loss(
+                    pred=pred_norm.clamp(min=1e-6),
+                    target=target_norm,
+                    theta=recon['theta'],
+                )
     
         return self.recon_weight * count_loss_nb * (1 - nonzero_fraction)
     
     def _compute_kl_loss(
         self,
-        mu: torch.Tensor,
-        logvar: torch.Tensor,
+        outputs: Dict[str, Any],
     ) -> torch.Tensor:
-        if self.get_stage() == "homology_loss":
-            return torch.tensor(0.0, device=self.device)
+        kl = torch.tensor(0.0, device=self.device)
+        if self.get_stage() != "transform_recon":
+            return kl
         
-        return -0.5 * torch.mean(1 + logvar - mu.pow(2).clamp(max=100) - logvar.exp().clamp(max=100))
+        for target_species_id in outputs:
+            # Get encoder outputs for all species
+            encoder_outputs = outputs[target_species_id]['encoder_outputs']
+            
+            # Compute KL for each encoding
+            for _, enc_output in encoder_outputs.items():
+                mu = enc_output['mu']
+                logvar = enc_output['logvar']
+                kl += -0.5 * torch.mean(1 + logvar - mu.pow(2).clamp(max=100) - logvar.exp().clamp(max=100))
+                
+        return kl
     
     def _single_species_compute_loss(
         self, 
         batch: BatchData,
         outputs: Dict[str, Any],
     ) -> Dict[str, torch.Tensor]:
-        target_species_id = batch.species_idx
 
-        recon_loss = self._compute_reconstruction_loss(outputs)
+        recon_loss = self._compute_reconstruction_loss(batch, outputs)
         
-        kl = self._compute_kl_loss(
-            outputs['encoder_outputs'][target_species_id]['mu'],
-            outputs['encoder_outputs'][target_species_id]['logvar']
-        )
+        kl = self._compute_kl_loss(outputs)
 
         homology_loss = self._compute_homology_loss(outputs, batch)
         
+
         beta = self.get_current_beta()
         total_loss = recon_loss + kl * beta + homology_loss
         
@@ -539,7 +503,7 @@ class CrossSpeciesVAE(pl.LightningModule):
         }
 
     def compute_loss(self, batch: BatchData, outputs: Dict[str, Any]) -> Dict[str, torch.Tensor]:
-        return self._single_species_compute_loss(batch, outputs)
+        return self._single_species_compute_loss(batch, outputs)        
     
     def _transform_expression(
         self,
@@ -556,61 +520,104 @@ class CrossSpeciesVAE(pl.LightningModule):
         transform_matrix = torch.zeros(
             n_dst_genes,
             n_src_genes,
-            device=batch.data.device
+            device=batch.data[src_species].device
         )
         transform_matrix[edges[:, 1], edges[:, 0]] = scores
         # Normalize transform matrix so src edges sum to 1.0 per dst gene
         transform_matrix = transform_matrix / (transform_matrix.sum(dim=1, keepdim=True) + 1e-8)
 
-        # Create dense input matrix
-        x = batch.data
+        x = batch.data[src_species]
 
         # Transform expression data
         transformed = x @ transform_matrix.t()
         return transformed
         
-    def _single_species_forward(self, batch: BatchData):
-        # Get target species ID for this batch
-        target_species_id = batch.species_idx
 
-        # 1. Direct reconstruction path
-        target_encoder_outputs = self.encoders[str(target_species_id)](batch)
+    def _transform_recon_forward(self, batch: BatchData) -> Dict[str, Any]:
+        """Handle transform reconstruction stage."""
+        results = {}
         
-        # Decode to all species
-        encoder_outputs = {target_species_id: target_encoder_outputs}
-        reconstructions = {}
-        inputs = {target_species_id: batch.data}
-
-        if self.get_stage() == "transform_recon":
-            # 2. Transform expression to other species
-            for species_id in self.species_vocab_sizes.keys():
-                if species_id == target_species_id:
-                    continue
-                
-                transformed = self._transform_expression(batch, target_species_id, species_id)
-                inputs[species_id] = transformed
-                transformed_encoder_outputs = self.encoders[str(species_id)](transformed)                
-                encoder_outputs[species_id] = transformed_encoder_outputs
+        # First encode all real data for conditioning
+        real_encodings = {}
+        for species_id, data in batch.data.items():
+            real_encodings[species_id] = self.encoders[str(species_id)](data)
+        
+        for target_species_id in batch.data:
+            # For each target species (A, B, C)
+            target_encoder = self.encoders[str(target_species_id)]
+            target_decoder = self.decoders[str(target_species_id)]
             
-            encoder_outputs_concat = {'z': torch.cat([encoder_outputs[species_id]['z'] for species_id in self.species_vocab_sizes.keys()], dim=1)}
-            for species_id in self.species_vocab_sizes.keys():                
-                transformed_reconstruction = self.decoders[str(species_id)](encoder_outputs_concat, fusion=True)
-                reconstructions[species_id] = transformed_reconstruction
+            reconstructions = {}
+            encoder_outputs = {}
+            
+            # 1. Encode real target data
+            encoder_outputs[target_species_id] = real_encodings[target_species_id]
+            
+            # 2. Transform and encode other species data to target space
+            for source_species_id in self.species_vocab_sizes.keys():
+                if source_species_id == target_species_id:
+                    continue
+                transformed = self._transform_expression(batch, source_species_id, target_species_id)
+                transformed_encoded = target_encoder(transformed)
+                encoder_outputs[source_species_id] = transformed_encoded
+            
+            # At this stage, encoder outputs have all gone through target encoder
+            # 0: A, 1: B-->A, 2: C-->A all went through target encoder (0)
+            
+            # For each source (including target itself), decode while conditioning on real encodings
+            for source_species_id in self.species_vocab_sizes.keys():
+                # Prepare decoder inputs: primary encoding + real conditioners
+                z_dict = {
+                    # Primary encoding (either real or transformed)
+                    target_species_id: encoder_outputs[source_species_id]['z'],
+                    # Real conditioners from other species
+                    **{k: real_encodings[k]['z'] for k in real_encodings.keys() if k != target_species_id}
+                }
+                reconstructions[source_species_id] = target_decoder(z_dict)
+            
+            results[target_species_id] = {
+                'encoder_outputs': encoder_outputs,
+                'reconstructions': reconstructions,
+            }
+        
+        return results
+
+    def _homology_loss_forward(self, batch: BatchData) -> Dict[str, Any]:
+        """Handle homology loss stage."""
+        results = {}
+        
+        # First encode all species data
+        encoded_species = {}
+        for species_id, data in batch.data.items():
+            encoded_species[species_id] = self.encoders[str(species_id)](data)
+        
+        # For each source species, decode into all target spaces
+        for src_species_id in batch.data:
+            z_dict = {species_id: outputs['z'] 
+                    for species_id, outputs in encoded_species.items()}
+            
+            reconstructions = {}
+            for dst_species_id in self.species_vocab_sizes.keys():
+                reconstructions[dst_species_id] = self.decoders[str(dst_species_id)](z_dict)
+            
+            results[src_species_id] = {
+                'encoder_outputs': {src_species_id: encoded_species[src_species_id]},
+                'reconstructions': reconstructions,
+            }
+        
+        return results
+
+    def forward(self, batch: BatchData) -> Dict[str, Any]:
+        """Main forward pass handling different stages."""
+        if self.get_stage() == "transform_recon":
+            return self._transform_recon_forward(batch)
+        elif self.get_stage() == "homology_loss":
+            return self._homology_loss_forward(batch)
         else:
-            target_reconstruction = self.decoders[str(target_species_id)](target_encoder_outputs, fusion=False)
-            reconstructions = {target_species_id: target_reconstruction}
+            raise ValueError(f"Unknown stage: {self.get_stage()}")
 
-        return {
-            'encoder_outputs': encoder_outputs,
-            'reconstructions': reconstructions,
-            'inputs': inputs,
-        }
-    
-    def forward(self, batch: BatchData):
-        return self._single_species_forward(batch)
-
-    def get_stage(self): # 0: direct recon loss, 1: transform recon loss with fused latents, 2: homology loss
-        return self.STAGE_MAPPING[self.trainer.current_epoch % 3]
+    def get_stage(self):
+        return self.STAGE_MAPPING[self.trainer.current_epoch % 2]
     
     @torch.no_grad()
     def get_latent_embeddings(
@@ -618,7 +625,6 @@ class CrossSpeciesVAE(pl.LightningModule):
         species_data: Dict[str, Union[str, List[str], ad.AnnData, List[ad.AnnData]]],
         return_species: bool = True,
         batch_size: int = 512,
-        fusion: bool = False,
         device: Optional[torch.device] = "cuda",
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         """
@@ -655,30 +661,15 @@ class CrossSpeciesVAE(pl.LightningModule):
         for batch in dataset:
             # Move batch to device
             batch = BatchData(
-                data=batch.data.to(device),
-                species_idx=batch.species_idx,
+                data={k: v.to(device) for k,v in batch.data.items()},
             )
-                    
-            if fusion:
-                # Get latents for all species
-                concat_latents = [
-                    self.encoders[str(species_id)](
-                        self._transform_expression(batch, batch.species_idx, species_id) 
-                        if species_id != batch.species_idx 
-                        else batch
-                    )['z'].cpu()
-                    for species_id in self.species_vocab_sizes.keys()
-                ]
-            else:
-                # Get latents only for input species
-                concat_latents = [self.encoders[str(batch.species_idx)](batch)['z'].cpu()]
-
-            latents = torch.cat(concat_latents, dim=1)
-            all_latents.append(latents)
-            
-            if return_species:
-                species_idx = torch.full((latents.shape[0],), batch.species_idx, dtype=torch.long, device=device)
-                all_species.append(species_idx)
+            for target_species_id in batch.data:
+                latents = self.encoders[str(target_species_id)](batch.data[target_species_id])['z'].cpu()
+                all_latents.append(latents)
+                
+                if return_species:
+                    species_idx = torch.full((latents.shape[0],), target_species_id, dtype=torch.long, device=device)
+                    all_species.append(species_idx)
         
         # Concatenate all batches
         latents = torch.cat(all_latents, dim=0)

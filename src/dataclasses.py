@@ -1,4 +1,4 @@
-from typing import Dict, Tuple
+from typing import Dict
 from dataclasses import dataclass
 
 import torch
@@ -6,6 +6,4 @@ import torch
 @dataclass
 class BatchData:
     """Sparse representation of gene expression data."""
-
-    data: torch.Tensor
-    species_idx: int
+    data: Dict[int, torch.Tensor]
