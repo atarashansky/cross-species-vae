@@ -5,35 +5,11 @@ import torch
 from torch import cuda
 import math
 import torch.nn as nn
-import torch.nn.functional as F
-from pytorch_lightning.callbacks import Callback
 
 from src.dataclasses import BatchData
 from src.data import CrossSpeciesInferenceDataset
-
-
-class GeneImportanceModule(nn.Module):
-    def __init__(self, n_genes: int, n_hidden: int = 128, dropout: float = 0.1):
-        super().__init__()
-        
-        self.global_weights = nn.Parameter(torch.ones(n_genes))
-
-        self.dropout = nn.Dropout(dropout)
-        self.context_net = nn.Sequential(
-            nn.LayerNorm(n_genes),
-            nn.Linear(n_genes, n_hidden),
-            nn.LayerNorm(n_hidden),
-            nn.ReLU(),
-            self.dropout,
-            nn.Linear(n_hidden, n_genes),
-            nn.Sigmoid()
-        )
-    
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        global_weights = torch.sigmoid(self.global_weights)
-        context_weights = self.context_net(x)
-        importance = global_weights * context_weights
-        return x * importance
+from src.utils import negative_binomial_loss
+from src.modules import GeneImportanceModule
 
 class Encoder(nn.Module):
     def __init__(
@@ -672,30 +648,3 @@ class CrossSpeciesVAE(pl.LightningModule):
         return latents
 
 
-def negative_binomial_loss(pred, target, theta, eps=1e-8):
-    """
-    Negative binomial loss with learnable dispersion parameter theta.
-
-    Args:
-        pred: torch.Tensor, predicted mean parameter (mu).
-        target: torch.Tensor, observed counts (y).
-        theta: torch.Tensor, dispersion parameter (theta), must be positive.
-        eps: float, small value for numerical stability.
-
-    Returns:
-        torch.Tensor: Scalar loss (mean negative log-likelihood).
-    """
-    # Ensure stability
-    pred = pred.clamp(min=eps)
-    theta = theta.clamp(min=eps)
-
-    # Negative binomial log likelihood
-    log_prob = (
-        torch.lgamma(target + theta)
-        - torch.lgamma(theta)
-        - torch.lgamma(target + 1)
-        + theta * (torch.log(theta + eps) - torch.log(theta + pred + eps))
-        + target * (torch.log(pred + eps) - torch.log(theta + pred + eps))
-    )
-
-    return -log_prob.mean()
