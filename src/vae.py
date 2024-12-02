@@ -366,29 +366,12 @@ class CrossSpeciesVAE(pl.LightningModule):
         if self.get_stage() != "homology_loss":
             return torch.tensor(0.0, device=self.device)
         
-        assembled_data = {}
-        for target_species_id in outputs:
-            # For each target species, collect real and transformed data
-            data_to_concat = []
-            
-            # Add data from each source species (including self)
-            for source_species_id in self.species_vocab_sizes.keys():
-                if source_species_id == target_species_id:
-                    # Use real data for matching species
-                    data_to_concat.append(batch.data[source_species_id])
-                else:
-                    # Use reconstructed data for other species
-                    recon = outputs[source_species_id]['reconstructions'][target_species_id]
-                    data_to_concat.append(recon['mean'])
-            
-            # Concatenate all data for this target species space
-            assembled_data[target_species_id] = torch.cat(data_to_concat, dim=0)
         
         homology_loss = torch.tensor(0.0, device=self.device)
         
         # Compute homology loss across species pairs
-        for src_species_id in assembled_data:
-            for dst_species_id in assembled_data:
+        for src_species_id in batch.data:
+            for dst_species_id in batch.data:
                 if src_species_id == dst_species_id:
                     continue
                 
@@ -397,8 +380,8 @@ class CrossSpeciesVAE(pl.LightningModule):
                 scores = torch.sigmoid(self.homology_scores[str(src_species_id)][str(dst_species_id)])
 
                 src, dst = edges.t()
-                src_pred = assembled_data[src_species_id][:, src]
-                dst_pred = assembled_data[dst_species_id][:, dst]
+                src_pred = outputs[src_species_id]['reconstructions'][src_species_id]['mean'][:, src]
+                dst_pred = outputs[src_species_id]['reconstructions'][dst_species_id]['mean'][:, dst]
 
                 # Center the predictions
                 src_centered = src_pred - src_pred.mean(dim=0)
