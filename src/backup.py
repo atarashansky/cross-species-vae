@@ -518,39 +518,6 @@ class CrossSpeciesVAE(pl.LightningModule):
         return transformed
         
 
-    """
-    All the different kinds of losses we can do:
-
-    1. A/B/C --> Encoder --> {concatenate latents} --> Decoder --> A/B/C
-
-        
-    2. A --> Encoder_A
-       A --> Transform(B) --> Encoder_B
-       A --> Transform(C) --> Encoder_C
-       {concatenate latents} --> Decoder --> A/B/C
-
-       Repeat (2) for each species
-
-       Loss is A vs Decoder_A, Transform(B) vs Decoder_B, Transform(C) vs Decoder_C
-               B vs Decoder_B, Transform(A) vs Decoder_A, Transform(C) vs Decoder_C
-               C vs Decoder_C, Transform(A) vs Decoder_A, Transform(B) vs Decoder_B
-    
-    3. A --> Encoder_A --> Decoder_A
-       A --> Transform(B) --> Encoder_B --> Decoder_A
-       A --> Transform(C) --> Encoder_C --> Decoder_A
-
-       B --> Encoder_B --> Decoder_B
-       B --> Transform(A) --> Encoder_A --> Decoder_B
-       B --> Transform(C) --> Encoder_C --> Decoder_B
-
-       C --> Encoder_C --> Decoder_C
-       C --> Transform(A) --> Encoder_A --> Decoder_C
-       C --> Transform(B) --> Encoder_B --> Decoder_C
-
-       Loss is A vs Decoder_A, Transform(B) vs Decoder_A, Transform(C) vs Decoder_A,
-               B vs Decoder_B, Transform(A) vs Decoder_B, Transform(C) vs Decoder_B,
-               C vs Decoder_C, Transform(A) vs Decoder_C, Transform(B) vs Decoder_C
-    """
     def _single_species_forward(self, batch: BatchData):
         results = {}
         for target_species_id, target_data in batch.data.items():

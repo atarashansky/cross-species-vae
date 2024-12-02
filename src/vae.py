@@ -93,27 +93,22 @@ class Decoder(nn.Module):
     def __init__(
         self,
         n_genes: int,
-        n_species: int,
         n_latent: int,
-        species_id: int,
         hidden_dims: list,
         dropout_rate: float = 0.1,
     ):
         super().__init__()
         self.log_theta = nn.Parameter(torch.ones(n_genes) * 2.3)
-        self.n_species = n_species
 
         # Technical scaling network
         self.scaling_net = nn.Sequential(
-            nn.Linear(n_latent * n_species, n_genes),
+            nn.Linear(n_latent, n_genes),
             nn.Sigmoid()
         )
 
-        self.species_id = species_id
-
         # Biological decoder network
         layers = []
-        dims = [n_latent * n_species] + hidden_dims + [n_genes]
+        dims = [n_latent] + hidden_dims + [n_genes]
         
         for i in range(len(dims) - 1):
             layers.extend([
@@ -126,17 +121,10 @@ class Decoder(nn.Module):
         self.decoder_net = nn.Sequential(*layers)     
     
     
-    def forward(self, z: Dict[int, torch.Tensor]) -> Dict[str, torch.Tensor]:
+    def forward(self, z: torch.Tensor) -> Dict[str, torch.Tensor]:
         # Get biological factors
-        all_latents = [z[self.species_id]]  # Primary species first
-        for species_idx in range(self.n_species):
-            if species_idx != self.species_id:
-                all_latents.append(z[species_idx])
-        
-        z_concat = torch.cat(all_latents, dim=1)
-        
-        bio_factors = self.decoder_net(z_concat)
-        scaling_factors = self.scaling_net(z_concat)
+        bio_factors = self.decoder_net(z)
+        scaling_factors = self.scaling_net(z)
         mean = bio_factors * scaling_factors
         theta = torch.exp(self.log_theta)  
         
@@ -213,8 +201,6 @@ class CrossSpeciesVAE(pl.LightningModule):
         self.decoders = nn.ModuleDict({
             str(species_id): Decoder(
                 n_genes=vocab_size,
-                n_species=self.n_species,
-                species_id=species_id,
                 n_latent=n_latent,
                 hidden_dims=hidden_dims[::-1],  # Reverse hidden dims for decoder
                 dropout_rate=dropout_rate,
@@ -245,6 +231,10 @@ class CrossSpeciesVAE(pl.LightningModule):
         self.gradient_clip_val = gradient_clip_val
         self.gradient_clip_algorithm = gradient_clip_algorithm
         self.validation_step_outputs = []
+
+        self.last_homology_loss = 0.0
+        self.last_recon_loss = 0.0
+        self.last_kl_loss = 0.0
         
 
 
@@ -379,7 +369,7 @@ class CrossSpeciesVAE(pl.LightningModule):
    
     def _compute_homology_loss(self, outputs: Dict[int, Any], batch: BatchData) -> torch.Tensor:   
         if self.get_stage() != "homology_loss":
-            return torch.tensor(0.0, device=self.device)
+            return self.last_homology_loss if isinstance(self.last_homology_loss, torch.Tensor) else torch.tensor(self.last_homology_loss, device=self.device)
         
         assembled_data = {}
         for target_species_id in outputs:
@@ -429,25 +419,29 @@ class CrossSpeciesVAE(pl.LightningModule):
 
                 homology_loss += alignment_loss
 
-        return self.homology_weight * homology_loss / (len(self.species_vocab_sizes) - 1)
+        loss = self.homology_weight * homology_loss / (len(self.species_vocab_sizes) - 1)
+        self.last_homology_loss = loss
+        return loss
+
 
     def _compute_reconstruction_loss(
         self,
-        batch: BatchData,
         outputs: Dict[str, Any],
+        batch: BatchData,
     ) -> torch.Tensor:
-        if self.get_stage() != "transform_recon":
-            return torch.tensor(0.0, device=self.device)
+        if self.get_stage() not in ["direct_recon", "transform_recon"]:
+            return self.last_recon_loss if isinstance(self.last_recon_loss, torch.Tensor) else torch.tensor(self.last_recon_loss, device=self.device)
         
         count_loss_nb = torch.tensor(0.0, device=self.device)
         for target_species_id in outputs:
-            target_counts = torch.exp(batch.data[target_species_id]) - 1
-            nonzero_fraction = (target_counts > 0).float().mean()        
-            target_norm = target_counts / target_counts.sum(dim=1, keepdim=True) * 10_000  
-
             reconstructions = outputs[target_species_id]['reconstructions']
+            
+            target_counts = batch.data[target_species_id]
+            target_counts = torch.exp(target_counts) - 1
+            nonzero_fraction = (target_counts > 0).float().mean()        
+            target_norm = target_counts / target_counts.sum(dim=1, keepdim=True) * 10_000                  
 
-            for species_id, recon in reconstructions.items():
+            for _, recon in reconstructions.items():
                 pred_counts = torch.exp(recon['mean']) - 1
                 pred_norm = pred_counts / pred_counts.sum(dim=1, keepdim=True) * 10_000            
                 
@@ -457,16 +451,18 @@ class CrossSpeciesVAE(pl.LightningModule):
                     theta=recon['theta'],
                 )
     
-        return self.recon_weight * count_loss_nb * (1 - nonzero_fraction)
+        loss = self.recon_weight * count_loss_nb * (1 - nonzero_fraction)
+        self.last_recon_loss = loss
+        return loss
     
     def _compute_kl_loss(
         self,
         outputs: Dict[str, Any],
     ) -> torch.Tensor:
-        kl = torch.tensor(0.0, device=self.device)
-        if self.get_stage() != "transform_recon":
-            return kl
+        if self.get_stage() not in ["direct_recon", "transform_recon"]:
+            return self.last_kl_loss if isinstance(self.last_kl_loss, torch.Tensor) else torch.tensor(self.last_kl_loss, device=self.device)
         
+        kl = torch.tensor(0.0, device=self.device)
         for target_species_id in outputs:
             # Get encoder outputs for all species
             encoder_outputs = outputs[target_species_id]['encoder_outputs']
@@ -477,15 +473,14 @@ class CrossSpeciesVAE(pl.LightningModule):
                 logvar = enc_output['logvar']
                 kl += -0.5 * torch.mean(1 + logvar - mu.pow(2).clamp(max=100) - logvar.exp().clamp(max=100))
                 
-        return kl
+        loss = kl
+        self.last_kl_loss = loss
+        return loss
     
-    def _single_species_compute_loss(
-        self, 
-        batch: BatchData,
-        outputs: Dict[str, Any],
-    ) -> Dict[str, torch.Tensor]:
 
-        recon_loss = self._compute_reconstruction_loss(batch, outputs)
+
+    def compute_loss(self, batch: BatchData, outputs: Dict[str, Any]) -> Dict[str, torch.Tensor]:
+        recon_loss = self._compute_reconstruction_loss(outputs, batch)
         
         kl = self._compute_kl_loss(outputs)
 
@@ -501,9 +496,7 @@ class CrossSpeciesVAE(pl.LightningModule):
             "kl": kl,
             "homology": homology_loss,
         }
-
-    def compute_loss(self, batch: BatchData, outputs: Dict[str, Any]) -> Dict[str, torch.Tensor]:
-        return self._single_species_compute_loss(batch, outputs)        
+    
     
     def _transform_expression(
         self,
@@ -531,57 +524,110 @@ class CrossSpeciesVAE(pl.LightningModule):
         # Transform expression data
         transformed = x @ transform_matrix.t()
         return transformed
-        
 
+    """
+    What worked (refer to main branch for a working implementation!!):
+    - Transform reconstruction (A vs A, A-->B vs B, A-->C vs C)
+    The decoder had two networks: multi-species and single-species.
+     - The multi-species network was used for the transform reconstruction. Multi-species network concatenated all latents (A, A-->B, A-->C) and decoded with the target decoders.
+     - The single-species network was used for the homology loss.
+    """
+    # TODO: This could be another stage but idk if it matters.
+    # def _transform_recon_forward_old(self, batch: BatchData) -> Dict[str, Any]:
+    #     """Handle transform reconstruction stage.
+        
+    #     For each source species:
+    #         1. Transform source data to all target spaces (A->B, A->C)
+    #         2. Encode all data (original and transformed) with respective encoders
+    #         3. Concatenate all latents and decode with each target decoder
+    #         4. Compare against original/transformed data
+    #     """
+    #     results = {}
+        
+    #     for source_species_id, source_data in batch.data.items():
+    #         # For each source species (A, B, C)            
+    #         reconstructions = {}
+    #         encoder_outputs = {}
+                        
+    #         source_encoder = self.encoders[str(source_species_id)]
+    #         source_encoded = source_encoder(source_data)
+    #         encoder_outputs[source_species_id] = source_encoded
+
+    #         inputs = {source_species_id: source_data}
+            
+    #         for target_species_id in self.species_vocab_sizes.keys():
+    #             if target_species_id == source_species_id:
+    #                 continue
+                    
+    #             # Transform source data to target space
+    #             transformed = self._transform_expression(batch, source_species_id, target_species_id)
+    #             inputs[target_species_id] = transformed
+                
+    #             # Encode transformed data with target encoder
+    #             target_encoder = self.encoders[str(target_species_id)]
+    #             transformed_encoded = target_encoder(transformed)
+    #             encoder_outputs[target_species_id] = transformed_encoded
+            
+    #         # Now decode using concatenated latents for each target space
+    #         for target_species_id in self.species_vocab_sizes.keys():
+    #             target_decoder = self.decoders[str(target_species_id)]
+
+    #             # Decode with target decoder using all latents
+    #             reconstructions[target_species_id] = target_decoder(encoder_outputs[target_species_id]['z'])
+            
+    #         results[source_species_id] = {
+    #             'encoder_outputs': encoder_outputs,
+    #             'reconstructions': reconstructions,
+    #             'inputs': inputs,
+    #         }
+        
+    #     return results
+    
     def _transform_recon_forward(self, batch: BatchData) -> Dict[str, Any]:
-        """Handle transform reconstruction stage."""
+        """Handle transform reconstruction stage.
+        
+        For each source species:
+            1. Transform source data to all target spaces (A->B, A->C)
+            2. Encode all data (original and transformed) with respective encoders
+            3. Concatenate all latents and decode with each target decoder
+            4. Compare against original/transformed data
+        """
         results = {}
         
-        # First encode all real data for conditioning
-        real_encodings = {}
-        for species_id, data in batch.data.items():
-            real_encodings[species_id] = self.encoders[str(species_id)](data)
-        
-        for target_species_id in batch.data:
-            # For each target species (A, B, C)
-            target_encoder = self.encoders[str(target_species_id)]
-            target_decoder = self.decoders[str(target_species_id)]
-            
+        for source_species_id, source_data in batch.data.items():
+            # For each source species (A, B, C)            
             reconstructions = {}
             encoder_outputs = {}
+                        
+            source_encoder = self.encoders[str(source_species_id)]
+            source_encoded = source_encoder(source_data)
+            encoder_outputs[source_species_id] = source_encoded
             
-            # 1. Encode real target data
-            encoder_outputs[target_species_id] = real_encodings[target_species_id]
-            
-            # 2. Transform and encode other species data to target space
-            for source_species_id in self.species_vocab_sizes.keys():
-                if source_species_id == target_species_id:
+            for target_species_id in self.species_vocab_sizes.keys():
+                if target_species_id == source_species_id:
                     continue
+                    
+                # Transform source data to target space
                 transformed = self._transform_expression(batch, source_species_id, target_species_id)
+                
+                # Encode transformed data with target encoder
+                target_encoder = self.encoders[str(target_species_id)]
                 transformed_encoded = target_encoder(transformed)
-                encoder_outputs[source_species_id] = transformed_encoded
+                encoder_outputs[target_species_id] = transformed_encoded
             
-            # At this stage, encoder outputs have all gone through target encoder
-            # 0: A, 1: B-->A, 2: C-->A all went through target encoder (0)
+            source_decoder = self.decoders[str(source_species_id)]
+            # Now decode using concatenated latents for each target space
+            for target_species_id in self.species_vocab_sizes.keys():
+                # Decode with target decoder using all latents
+                reconstructions[target_species_id] = source_decoder(encoder_outputs[target_species_id]['z'])
             
-            # For each source (including target itself), decode while conditioning on real encodings
-            for source_species_id in self.species_vocab_sizes.keys():
-                # Prepare decoder inputs: primary encoding + real conditioners
-                z_dict = {
-                    # Primary encoding (either real or transformed)
-                    target_species_id: encoder_outputs[source_species_id]['z'],
-                    # Real conditioners from other species
-                    **{k: real_encodings[k]['z'] for k in real_encodings.keys() if k != target_species_id}
-                }
-                reconstructions[source_species_id] = target_decoder(z_dict)
-            
-            results[target_species_id] = {
+            results[source_species_id] = {
                 'encoder_outputs': encoder_outputs,
                 'reconstructions': reconstructions,
             }
         
         return results
-
+        
     def _homology_loss_forward(self, batch: BatchData) -> Dict[str, Any]:
         """Handle homology loss stage."""
         results = {}
@@ -593,12 +639,10 @@ class CrossSpeciesVAE(pl.LightningModule):
         
         # For each source species, decode into all target spaces
         for src_species_id in batch.data:
-            z_dict = {species_id: outputs['z'] 
-                    for species_id, outputs in encoded_species.items()}
             
             reconstructions = {}
             for dst_species_id in self.species_vocab_sizes.keys():
-                reconstructions[dst_species_id] = self.decoders[str(dst_species_id)](z_dict)
+                reconstructions[dst_species_id] = self.decoders[str(dst_species_id)](encoded_species[src_species_id]['z'])
             
             results[src_species_id] = {
                 'encoder_outputs': {src_species_id: encoded_species[src_species_id]},
