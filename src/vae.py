@@ -317,9 +317,11 @@ class CrossSpeciesVAE(pl.LightningModule):
         loss_dict = self.compute_loss(batch, outputs)
         for key, value in loss_dict.items():
             log_key = f"train_{key}"
-            if value.item() == 0.0:
+            if value == 0.0:
                 value = getattr(self, f"last_{key}_loss")
-            self.log(log_key, value.detach(), sync_dist=True)
+
+            value_to_log = value.detach() if torch.is_tensor(value) else value
+            self.log(log_key, value_to_log, sync_dist=True)
         
         return loss_dict["loss"]
         
@@ -335,9 +337,11 @@ class CrossSpeciesVAE(pl.LightningModule):
         log_loss_dict = {}
         for key, value in loss_dict.items():
             log_key = f"val_{key}"
-            if value.item() == 0.0:
+            if value == 0.0:
                 value = getattr(self, f"last_{key}_loss")
-            log_loss_dict[log_key] = value.detach()
+            # Convert all values to tensors
+            value_to_log = torch.tensor(value, device=self.device) if isinstance(value, float) else value.detach()
+            log_loss_dict[log_key] = value_to_log
             
         self.validation_step_outputs.append(log_loss_dict)
         
@@ -349,7 +353,7 @@ class CrossSpeciesVAE(pl.LightningModule):
             return
         
         metrics = {
-            key: torch.stack([x[key] for x in self.validation_step_outputs]).mean()
+            key: torch.stack([x[key] if isinstance(x[key], torch.Tensor) else torch.tensor(x[key], device=self.device) for x in self.validation_step_outputs]).mean()
             for key in self.validation_step_outputs[0].keys()
         }
 
