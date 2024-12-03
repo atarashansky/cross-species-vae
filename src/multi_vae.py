@@ -14,11 +14,11 @@ from src.modules import Encoder, Decoder
 class CrossSpeciesVAE(pl.LightningModule):
     """Cross-species VAE with multi-scale encoding and species-specific components."""
 
-    STAGE_MAPPING = {
-        0: "direct_recon",
-        1: "transform_recon",
-        2: "homology_loss",
-    }
+    STAGE_MAPPING = [
+        #"direct_recon",
+        "transform_recon",
+        "homology_loss",
+    ]
 
     def __init__(
         self,
@@ -485,7 +485,7 @@ class CrossSpeciesVAE(pl.LightningModule):
             raise ValueError(f"Unknown stage: {self.get_stage()}")
 
     def get_stage(self):
-        return self.STAGE_MAPPING[self.trainer.current_epoch % 3]
+        return self.STAGE_MAPPING[self.trainer.current_epoch % len(self.STAGE_MAPPING)]
     
     @torch.no_grad()
     def get_latent_embeddings(
