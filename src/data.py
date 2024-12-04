@@ -16,7 +16,6 @@ class CrossSpeciesDataset(IterableDataset):
         self,
         species_data: Dict[str, ad.AnnData],
         batch_size: int = 128,
-        seed: int = 0,
         yield_pairwise: bool = False,
     ):
         """
@@ -29,7 +28,6 @@ class CrossSpeciesDataset(IterableDataset):
         """
         super().__init__()
         self.batch_size = batch_size
-        self.seed = seed
         
         # Store species data directly
         self.species_data = species_data
@@ -45,7 +43,6 @@ class CrossSpeciesDataset(IterableDataset):
         }
         
         # Initialize sampling state
-        self.rng = np.random.RandomState(seed)
         self._init_sampling_state()
         
         self.worker_id = None
@@ -54,6 +51,10 @@ class CrossSpeciesDataset(IterableDataset):
 
     def _init_sampling_state(self):
         """Initialize sampling state for each species."""
+        # Generate new random seed for each epoch
+        new_seed = np.random.randint(1e9)
+        self.rng = np.random.RandomState(new_seed)
+        
         self.available_indices = {
             species: indices.copy() 
             for species, indices in self.species_indices.items()
@@ -171,7 +172,6 @@ class CrossSpeciesDataModule(pl.LightningDataModule):
         num_workers: int = 4,
         val_split: float = 0.1,
         test_split: float = 0.1,
-        seed: int = 0,
         yield_pairwise: bool = False,
     ):
         """
@@ -195,14 +195,11 @@ class CrossSpeciesDataModule(pl.LightningDataModule):
         self.num_workers = num_workers
         self.val_split = val_split
         self.test_split = test_split
-        self.seed = seed
 
         self.train_dataset = None
         self.val_dataset = None
         self.test_dataset = None
         self.yield_pairwise = yield_pairwise
-        # Set random seed for reproducibility
-        np.random.seed(seed)
 
     def _load_species_data(self, data):
         """Load and concatenate data for a single species."""
@@ -272,14 +269,12 @@ class CrossSpeciesDataModule(pl.LightningDataModule):
             self.train_dataset = CrossSpeciesDataset(
                 species_data=train_data,
                 batch_size=self.batch_size,
-                seed=self.seed,
                 yield_pairwise=self.yield_pairwise,
             )
             
             self.val_dataset = CrossSpeciesDataset(
                 species_data=val_data,
                 batch_size=self.batch_size,
-                seed=self.seed,
                 yield_pairwise=self.yield_pairwise,
             )
 
@@ -287,7 +282,6 @@ class CrossSpeciesDataModule(pl.LightningDataModule):
             self.test_dataset = CrossSpeciesDataset(
                 species_data=test_data,
                 batch_size=self.batch_size,
-                seed=self.seed,
                 yield_pairwise=self.yield_pairwise,
             )
         
