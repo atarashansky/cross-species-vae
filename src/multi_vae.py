@@ -136,7 +136,7 @@ class CrossSpeciesVAE(pl.LightningModule):
                 )
                 return max(
                     self.min_learning_rate / self.learning_rate,
-                    0.5 * (1.0 + math.cos(math.pi * progress)),
+                    0.5 * (1.0 + math.cos(math.pi * progress * 0.85)), # TODO: slower cosine decay
                 )
 
         scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
@@ -263,6 +263,7 @@ class CrossSpeciesVAE(pl.LightningModule):
         for src_species_id in batch.data:
             # Get original encoding
             original_encoding = outputs[src_species_id]['encoder_outputs'][src_species_id]
+            homology_reconstructions = outputs[src_species_id]['homology_reconstructions']
             
             # For each target species (except source)
             for dst_species_id in self.species_vocab_sizes.keys():
@@ -270,8 +271,7 @@ class CrossSpeciesVAE(pl.LightningModule):
                     continue
                     
                 # Pass through target decoder
-                dst_decoder = self.decoders[str(dst_species_id)]
-                decoded = dst_decoder(original_encoding['z'])
+                decoded = homology_reconstructions[dst_species_id]
                 
                 # Re-encode with target encoder
                 dst_encoder = self.encoders[str(dst_species_id)]
@@ -291,7 +291,8 @@ class CrossSpeciesVAE(pl.LightningModule):
         
         return self.cycle_weight * cycle_loss / counter   
     
-    def _compute_homology_loss(self, outputs: Dict[int, Any], batch: BatchData) -> torch.Tensor:           
+    def _compute_homology_loss(self, outputs: Dict[int, Any], batch: BatchData) -> torch.Tensor:   
+
         homology_loss = torch.tensor(0.0, device=self.device)
         counter = 0
         # Compute homology loss across species pairs
@@ -302,7 +303,7 @@ class CrossSpeciesVAE(pl.LightningModule):
                 
                 # Get edges and scores for this species pair
                 edges = getattr(self, f'edges_{src_species_id}_{dst_species_id}')
-                scores = torch.sigmoid(self.homology_scores[str(src_species_id)][str(dst_species_id)])
+                scores = torch.sigmoid(self.homology_scores[str(src_species_id)][str(dst_species_id)].detach())
 
                 src, dst = edges.t()
                                 
@@ -322,8 +323,11 @@ class CrossSpeciesVAE(pl.LightningModule):
                 dst_std = dst_centered.std(dim=0)
                 correlation = covariance / (src_std * dst_std + 1e-8)
 
-                alignment_loss = 1 - torch.mean(torch.sqrt((correlation + 1)/2 * scores + 1e-8))
-
+                alignment_loss = torch.mean(
+                    scores * (1 - correlation.clamp(min=0)) 
+                    + (1 - scores) * correlation.clamp(min=0) 
+                )
+                
                 homology_loss += alignment_loss
                 counter += 1
 
@@ -431,31 +435,7 @@ class CrossSpeciesVAE(pl.LightningModule):
         return transformed
 
 
-    
-    def _direct_recon_forward(self, batch: BatchData) -> Dict[str, Any]:
-        """Handle direct reconstruction stage."""
-        results = {}
-        
-        for source_species_id, source_data in batch.data.items():
-            # For each source species (A, B, C)            
-            reconstructions = {}
-            encoder_outputs = {}
-                        
-            source_encoder = self.encoders[str(source_species_id)]
-            source_encoded = source_encoder(source_data)
-            encoder_outputs[source_species_id] = source_encoded
-                        
-            source_decoder = self.decoders[str(source_species_id)]
-            reconstructions[source_species_id] = source_decoder(encoder_outputs[source_species_id]['z'])
-            
-            results[source_species_id] = {
-                'encoder_outputs': encoder_outputs,
-                'reconstructions': reconstructions,
-            }
-        
-        return results
-
-
+   
     def forward(self, batch: BatchData) -> Dict[str, Any]:
         results = {}
         
