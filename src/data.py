@@ -17,6 +17,7 @@ class CrossSpeciesDataset(IterableDataset):
         species_data: Dict[str, ad.AnnData],
         batch_size: int = 128,
         seed: int = 0,
+        yield_pairwise: bool = False,
     ):
         """
         Initialize dataset.
@@ -49,6 +50,7 @@ class CrossSpeciesDataset(IterableDataset):
         
         self.worker_id = None
         self.num_workers = None
+        self.yield_pairwise = yield_pairwise
 
     def _init_sampling_state(self):
         """Initialize sampling state for each species."""
@@ -66,7 +68,6 @@ class CrossSpeciesDataset(IterableDataset):
 
     def _get_batch_indices(self):
         """Get batch of indices for current species."""
-        # Instead of balanced sampling, sample from one species
         species = self.current_species
         available = self.available_indices[species]
         
@@ -80,9 +81,17 @@ class CrossSpeciesDataset(IterableDataset):
                 available, 
                 selected_idx
             )
+            
+            # Update seen indices for largest dataset
+            if species == self.largest_species:
+                self.seen_largest_dataset.update(selected_idx)
         else:
             selected_idx = available
             num_missing = self.batch_size - len(selected_idx)
+            
+            if species == self.largest_species:
+                self.seen_largest_dataset.update(selected_idx)
+            
             selected_idx = np.concatenate([
                 selected_idx,
                 self.rng.choice(
@@ -91,7 +100,7 @@ class CrossSpeciesDataset(IterableDataset):
                     replace=True
                 )
             ])
-            
+        
         return np.array(selected_idx)
 
     def _epoch_finished(self):
@@ -124,11 +133,10 @@ class CrossSpeciesDataset(IterableDataset):
     
     def __len__(self):
         """Return the number of batches per epoch."""
-        # Since we cycle through all species in round-robin fashion,
-        # multiply the number of batches by number of species
         cells_in_largest = max(self.n_cells_per_species.values())
         batches_for_largest = int(np.ceil(cells_in_largest / self.batch_size))
-        return batches_for_largest * len(self.species_names)
+        len_multiplier = len(self.species_names) * (len(self.species_names) - 1) // 2 if self.yield_pairwise else 1
+        return batches_for_largest * len_multiplier
     
     def __iter__(self):
         """Iterate over species in round-robin fashion."""
@@ -136,7 +144,6 @@ class CrossSpeciesDataset(IterableDataset):
         self._init_sampling_state()
 
         while not self._epoch_finished():
-            # Cycle through species
             data = {}
             for species in self.species_names:
                 self.current_species = species
@@ -144,7 +151,15 @@ class CrossSpeciesDataset(IterableDataset):
                 species_idx = self.species_to_idx[species]
                 data[species_idx] = self._create_batch(indices)
             
-            yield BatchData(data=data)
+            if self.yield_pairwise:
+                for i in range(len(data)):
+                    for j in range(i + 1, len(data)):
+                        yield BatchData(data={
+                            i: data[i],
+                            j: data[j]
+                        })
+            else:
+                yield BatchData(data=data)
 
 class CrossSpeciesDataModule(pl.LightningDataModule):
     """PyTorch Lightning data module for cross-species data."""
@@ -157,6 +172,7 @@ class CrossSpeciesDataModule(pl.LightningDataModule):
         val_split: float = 0.1,
         test_split: float = 0.1,
         seed: int = 0,
+        yield_pairwise: bool = False,
     ):
         """
         Initialize data module.
@@ -184,7 +200,7 @@ class CrossSpeciesDataModule(pl.LightningDataModule):
         self.train_dataset = None
         self.val_dataset = None
         self.test_dataset = None
-        
+        self.yield_pairwise = yield_pairwise
         # Set random seed for reproducibility
         np.random.seed(seed)
 
@@ -257,12 +273,14 @@ class CrossSpeciesDataModule(pl.LightningDataModule):
                 species_data=train_data,
                 batch_size=self.batch_size,
                 seed=self.seed,
+                yield_pairwise=self.yield_pairwise,
             )
             
             self.val_dataset = CrossSpeciesDataset(
                 species_data=val_data,
                 batch_size=self.batch_size,
                 seed=self.seed,
+                yield_pairwise=self.yield_pairwise,
             )
 
         if stage == "test" or stage is None:
@@ -270,6 +288,7 @@ class CrossSpeciesDataModule(pl.LightningDataModule):
                 species_data=test_data,
                 batch_size=self.batch_size,
                 seed=self.seed,
+                yield_pairwise=self.yield_pairwise,
             )
         
 

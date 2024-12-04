@@ -34,7 +34,6 @@ class CrossSpeciesVAE(pl.LightningModule):
         recon_weight: float = 1.0,
         homology_weight: float = 1.0,
         cycle_weight: float = 1.0,
-        stages: List[str] = ["direct_recon","transform_recon","homology_loss"],
     ):
         super().__init__()
         self.save_hyperparameters(ignore=['homology_edges', 'homology_scores'])
@@ -114,8 +113,6 @@ class CrossSpeciesVAE(pl.LightningModule):
         self.gradient_clip_val = gradient_clip_val
         self.gradient_clip_algorithm = gradient_clip_algorithm
         self.validation_step_outputs = []
-
-        self.stages = stages
 
 
     def configure_optimizers(self):
@@ -245,7 +242,6 @@ class CrossSpeciesVAE(pl.LightningModule):
         if cuda.is_available():
             cuda.empty_cache()
 
-        print(f"Current epoch: {self.trainer.current_epoch}", "Current stage: ", self.get_stage())
         
         
     def _compute_cycle_consistency_loss(
@@ -261,9 +257,6 @@ class CrossSpeciesVAE(pl.LightningModule):
             3. Re-encode with target encoder
             4. Compare original and re-encoded representations
         """
-        # if self.get_stage() != "cycle":
-        #     return torch.tensor(0.0, device=self.device)
-        
         cycle_loss = torch.tensor(0.0, device=self.device)
         counter = 0
         
@@ -298,10 +291,7 @@ class CrossSpeciesVAE(pl.LightningModule):
         
         return self.cycle_weight * cycle_loss / counter   
     
-    def _compute_homology_loss(self, outputs: Dict[int, Any], batch: BatchData) -> torch.Tensor:   
-        if self.get_stage() != "homology_loss":
-            return torch.tensor(0.0, device=self.device)
-        
+    def _compute_homology_loss(self, outputs: Dict[int, Any], batch: BatchData) -> torch.Tensor:           
         homology_loss = torch.tensor(0.0, device=self.device)
         counter = 0
         # Compute homology loss across species pairs
@@ -315,8 +305,12 @@ class CrossSpeciesVAE(pl.LightningModule):
                 scores = torch.sigmoid(self.homology_scores[str(src_species_id)][str(dst_species_id)])
 
                 src, dst = edges.t()
-                src_pred = outputs[src_species_id]['reconstructions'][src_species_id]['mean'][:, src]
-                dst_pred = outputs[src_species_id]['reconstructions'][dst_species_id]['mean'][:, dst]
+                                
+                src_data = outputs[src_species_id]['homology_reconstructions'][src_species_id]['mean']
+                dst_data = outputs[src_species_id]['homology_reconstructions'][dst_species_id]['mean']
+                
+                src_pred = src_data[:, src]
+                dst_pred = dst_data[:, dst]
 
                 # Center the predictions
                 src_centered = src_pred - src_pred.mean(dim=0)
@@ -341,11 +335,10 @@ class CrossSpeciesVAE(pl.LightningModule):
         outputs: Dict[str, Any],
         batch: BatchData,
     ) -> torch.Tensor:
-        if self.get_stage() not in ["direct_recon", "transform_recon"]:
-            return torch.tensor(0.0, device=self.device)
-        
+    
         count_loss_nb = torch.tensor(0.0, device=self.device)
         counter = 0
+        
         for target_species_id in outputs:
             reconstructions = outputs[target_species_id]['reconstructions']
             
@@ -371,9 +364,6 @@ class CrossSpeciesVAE(pl.LightningModule):
         self,
         outputs: Dict[str, Any],
     ) -> torch.Tensor:
-        if self.get_stage() not in ["direct_recon", "transform_recon"]:
-            return torch.tensor(0.0, device=self.device)
-        
         kl = torch.tensor(0.0, device=self.device)
         counter = 0
         for target_species_id in outputs:
@@ -466,15 +456,7 @@ class CrossSpeciesVAE(pl.LightningModule):
         return results
 
 
-    def _transform_recon_forward(self, batch: BatchData) -> Dict[str, Any]:
-        """Handle transform reconstruction stage.
-        
-        For each source species:
-            1. Transform source data to all target spaces (A->B, A->C)
-            2. Encode all data (original and transformed) with respective encoders
-            3. Concatenate all latents and decode with each target decoder
-            4. Compare against original/transformed data
-        """
+    def forward(self, batch: BatchData) -> Dict[str, Any]:
         results = {}
         
         for source_species_id, source_data in batch.data.items():
@@ -504,50 +486,17 @@ class CrossSpeciesVAE(pl.LightningModule):
                 # Decode with target decoder using all latents
                 reconstructions[target_species_id] = source_decoder(encoder_outputs[target_species_id]['z'])
             
+            homology_reconstructions = {}
+            for dst_species_id in self.species_vocab_sizes.keys():
+                homology_reconstructions[dst_species_id] = self.decoders[str(dst_species_id)](encoder_outputs[source_species_id]['z'])
+                        
             results[source_species_id] = {
                 'encoder_outputs': encoder_outputs,
                 'reconstructions': reconstructions,
+                'homology_reconstructions': homology_reconstructions,
             }
-        
-        return results
-        
-    def _homology_loss_forward(self, batch: BatchData) -> Dict[str, Any]:
-        """Handle homology loss stage."""
-        results = {}
-        
-        # First encode all species data
-        encoded_species = {}
-        for species_id, data in batch.data.items():
-            encoded_species[species_id] = self.encoders[str(species_id)](data)
-        
-        # For each source species, decode into all target spaces
-        for src_species_id in batch.data:
-            
-            reconstructions = {}
-            for dst_species_id in self.species_vocab_sizes.keys():
-                reconstructions[dst_species_id] = self.decoders[str(dst_species_id)](encoded_species[src_species_id]['z'])
-            
-            results[src_species_id] = {
-                'encoder_outputs': {src_species_id: encoded_species[src_species_id]},
-                'reconstructions': reconstructions,
-            }
-        
         return results
 
-    def forward(self, batch: BatchData) -> Dict[str, Any]:
-        """Main forward pass handling different stages."""
-        if self.get_stage() == "direct_recon" or self.get_stage() == "cycle":
-            return self._direct_recon_forward(batch)
-        elif self.get_stage() == "transform_recon":
-            return self._transform_recon_forward(batch)
-        elif self.get_stage() == "homology_loss":
-            return self._homology_loss_forward(batch)
-        else:
-            raise ValueError(f"Unknown stage: {self.get_stage()}")
-
-    def get_stage(self):
-        return self.stages[self.trainer.current_epoch % len(self.stages)]
-    
     @torch.no_grad()
     def get_latent_embeddings(
         self,
