@@ -90,12 +90,6 @@ class Decoder(nn.Module):
         super().__init__()
         self.log_theta = nn.Parameter(torch.ones(n_genes) * 2.3)
 
-        # Technical scaling network
-        self.scaling_net = nn.Sequential(
-            nn.Linear(n_latent, n_genes),
-            nn.Sigmoid()
-        )
-
         # Biological decoder network
         layers = []
         dims = [n_latent] + hidden_dims + [n_genes]
@@ -112,14 +106,8 @@ class Decoder(nn.Module):
     
     
     def forward(self, z: torch.Tensor) -> Dict[str, torch.Tensor]:
-        # Get biological factors
-        bio_factors = self.decoder_net(z)
-        scaling_factors = self.scaling_net(z)
-        mean = bio_factors * scaling_factors
-        theta = torch.exp(self.log_theta)  
-        
         return {
-            'mean': mean,
-            'theta': theta
+            'mean': self.decoder_net(z),
+            'theta': torch.exp(self.log_theta)
         }
     
