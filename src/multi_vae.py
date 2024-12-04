@@ -33,7 +33,6 @@ class CrossSpeciesVAE(pl.LightningModule):
         gradient_clip_algorithm: str = "norm",
         recon_weight: float = 1.0,
         homology_weight: float = 1.0,
-        cycle_weight: float = 1.0,
     ):
         super().__init__()
         self.save_hyperparameters(ignore=['homology_edges', 'homology_scores'])
@@ -46,7 +45,6 @@ class CrossSpeciesVAE(pl.LightningModule):
                     
         self.recon_weight = recon_weight
         self.homology_weight = homology_weight
-        self.cycle_weight = cycle_weight
         self.init_beta = init_beta
         self.final_beta = final_beta
         self.current_beta = init_beta  # Track current beta value
@@ -289,7 +287,7 @@ class CrossSpeciesVAE(pl.LightningModule):
 
                 counter += 1
         
-        return self.cycle_weight * cycle_loss / counter   
+        return cycle_loss / counter   
     
     def _compute_homology_loss(self, outputs: Dict[int, Any], batch: BatchData) -> torch.Tensor:   
 
@@ -325,7 +323,7 @@ class CrossSpeciesVAE(pl.LightningModule):
 
                 alignment_loss = torch.mean(
                     scores * (1 - correlation.clamp(min=0)) 
-                    + (1 - scores) * correlation.clamp(min=0) 
+                    # + (1 - scores) * correlation.clamp(min=0) # TODO uncomment
                 )
                 
                 homology_loss += alignment_loss
@@ -396,7 +394,7 @@ class CrossSpeciesVAE(pl.LightningModule):
         
 
         beta = self.get_current_beta()
-        total_loss = recon_loss + kl * beta + homology_loss + cycle_loss
+        total_loss = recon_loss + kl * beta + homology_loss + beta * cycle_loss
         
         return {
             "loss": total_loss,
