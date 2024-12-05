@@ -174,12 +174,12 @@ class CrossSpeciesVAE(pl.LightningModule):
         if self.trainer is None:
             return self.init_beta
             
-        # Get current epoch and total epochs
-        current_epoch = self.trainer.current_epoch
-        max_epochs = self.trainer.max_epochs
+        # Get current step and total steps
+        current_step = self.trainer.global_step
+        total_steps = self.trainer.estimated_stepping_batches
         
         # Linear warmup from init_beta to final_beta
-        progress = current_epoch / max_epochs
+        progress = current_step / total_steps
         beta = self.init_beta + (self.final_beta - self.init_beta) * progress
         return beta
     

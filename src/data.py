@@ -15,16 +15,22 @@ class CrossSpeciesDataset(IterableDataset):
     def __init__(
         self,
         species_data: Dict[str, ad.AnnData],
+        species_indices: Dict[str, np.ndarray],
         batch_size: int = 128,
         yield_pairwise: bool = False,
+        subsample_size: Optional[int] = None,
+        subsample_by: Optional[Dict[str, str]] = None,
     ):
         """
         Initialize dataset.
 
         Args:
             species_data: Dictionary mapping species names to preprocessed AnnData objects
+            species_indices: Dictionary mapping species names to array of valid indices
             batch_size: Number of cells per batch (per species)
-            seed: Random seed for reproducibility
+            yield_pairwise: Whether to yield pairwise combinations of species
+            subsample_size: If provided, subsample each species to this number of cells
+            subsample_by: If provided, column name in obs metadata to use for stratified subsampling
         """
         super().__init__()
         self.batch_size = batch_size
@@ -37,17 +43,77 @@ class CrossSpeciesDataset(IterableDataset):
         self.species_to_idx = {name: idx for idx, name in enumerate(self.species_names)}
         
         # Create indices for each species
-        self.species_indices = {
-            species: np.arange(data.n_obs)
-            for species, data in species_data.items()
-        }
-        
-        # Initialize sampling state
-        self._init_sampling_state()
+        self.species_indices = species_indices
         
         self.worker_id = None
         self.num_workers = None
         self.yield_pairwise = yield_pairwise
+        self.subsample_size = subsample_size
+        self.subsample_by = subsample_by
+                
+        # Initialize sampling state
+        self._init_sampling_state()
+        
+
+
+    def _subsample_indices(self, species: str, indices: np.ndarray) -> np.ndarray:
+        """Subsample indices, optionally maintaining proportions of a metadata column."""
+        if self.subsample_size is None:
+            return indices
+        
+        if self.subsample_by is None:
+            # Simple random subsampling
+            return self.rng.choice(indices, size=self.subsample_size, replace=False)
+        
+        # Stratified subsampling
+        adata = self.species_data[species]
+        labels = adata.obs[self.subsample_by[species]][indices]
+        unique_labels, counts = np.unique(labels, return_counts=True)
+        
+        # Calculate target size for each label
+        props = counts / len(indices)
+        target_sizes = np.round(props * self.subsample_size).astype(int)
+        
+        # Adjust if rounding caused total to differ from target
+        diff = self.subsample_size - target_sizes.sum()
+        if diff != 0:
+            # Add/subtract from largest group(s)
+            idx_sorted = np.argsort(target_sizes)[::-1]
+            for i in range(abs(diff)):
+                target_sizes[idx_sorted[i]] += np.sign(diff)
+        
+        # Sample from each group
+        sampled_indices = []
+        remaining_target = self.subsample_size
+        available_indices = indices.copy()
+        
+        for label, target_size in zip(unique_labels, target_sizes):
+            label_indices = indices[labels == label]
+            
+            if target_size >= len(label_indices):
+                # Take all available cells from this group
+                sampled_indices.append(label_indices)
+                remaining_target -= len(label_indices)
+                # Remove these indices from available pool
+                available_indices = np.setdiff1d(available_indices, label_indices)
+            else:
+                # Sample without replacement
+                sampled = self.rng.choice(label_indices, size=target_size, replace=False)
+                sampled_indices.append(sampled)
+                remaining_target -= target_size
+                # Remove these indices from available pool
+                available_indices = np.setdiff1d(available_indices, sampled)
+        
+        # If we still need more cells, sample from all indices
+        if remaining_target > 0:
+            # If no available indices left, resample from all indices
+            if len(available_indices) < remaining_target:
+                extra_samples = available_indices
+            else:
+                extra_samples = self.rng.choice(available_indices, size=remaining_target, replace=False)
+            sampled_indices.append(extra_samples)
+        
+        return np.concatenate(sampled_indices)
 
     def _init_sampling_state(self):
         """Initialize sampling state for each species."""
@@ -55,22 +121,33 @@ class CrossSpeciesDataset(IterableDataset):
         new_seed = np.random.randint(1e9)
         self.rng = np.random.RandomState(new_seed)
         
-        self.available_indices = {
-            species: indices.copy() 
+        # Subsample indices for each species
+        available_indices = {
+            species: self._subsample_indices(species, indices.copy())
             for species, indices in self.species_indices.items()
         }
+        
+        # Subset AnnData objects for the epoch and create new indices
+        self.epoch_data = {}
+        self.epoch_indices = {}
+        for species, indices in available_indices.items():
+            # Subset the AnnData
+            self.epoch_data[species] = self.species_data[species][indices].copy()
+            # Create new sequential indices for the subsetted data
+            self.epoch_indices[species] = np.arange(len(indices))
+        
         self.seen_largest_dataset = set()
         
         # Find species with max cells for epoch tracking
         self.largest_species = max(
-            self.n_cells_per_species.items(), 
+            ((species, len(data)) for species, data in self.epoch_data.items()),
             key=lambda x: x[1]
         )[0]
 
     def _get_batch_indices(self):
         """Get batch of indices for current species."""
         species = self.current_species
-        available = self.available_indices[species]
+        available = self.epoch_indices[species]
         
         if len(available) >= self.batch_size:
             selected_idx = self.rng.choice(
@@ -78,7 +155,7 @@ class CrossSpeciesDataset(IterableDataset):
                 self.batch_size, 
                 replace=False
             )
-            self.available_indices[species] = np.setdiff1d(
+            self.epoch_indices[species] = np.setdiff1d(
                 available, 
                 selected_idx
             )
@@ -93,10 +170,12 @@ class CrossSpeciesDataset(IterableDataset):
             if species == self.largest_species:
                 self.seen_largest_dataset.update(selected_idx)
             
+            # Use indices within range of epoch_data
+            max_idx = len(self.epoch_data[species]) - 1
             selected_idx = np.concatenate([
                 selected_idx,
                 self.rng.choice(
-                    self.species_indices[species], 
+                    np.arange(max_idx + 1), 
                     num_missing, 
                     replace=True
                 )
@@ -106,16 +185,12 @@ class CrossSpeciesDataset(IterableDataset):
 
     def _epoch_finished(self):
         """Check if we've seen all cells from the largest dataset."""
-        return len(self.seen_largest_dataset) >= self.n_cells_per_species[self.largest_species]
+        return len(self.seen_largest_dataset) >= len(self.epoch_data[self.largest_species])
 
     def _create_batch(self, indices):
-        """Create a SparseExpressionData batch from indices."""
+        """Create batch from pre-subsetted epoch data."""
         species = self.current_species
-        species_adata = self.species_data[species]
-        
-        # Get batch data
-        batch_data = species_adata[indices]
-        return torch.from_numpy(batch_data.X.toarray() if sp.sparse.issparse(batch_data.X) else batch_data.X)
+        return torch.from_numpy(self.epoch_data[species].X[indices].toarray())
 
     def _initialize_worker_info(self):
         """Initialize worker information for distributed training."""
@@ -123,18 +198,11 @@ class CrossSpeciesDataset(IterableDataset):
         if worker_info is not None:
             self.worker_id = worker_info.id
             self.num_workers = worker_info.num_workers
-    
-    @property
-    def n_cells_per_species(self):
-        """Number of cells per species."""
-        return {
-            species: len(indices)
-            for species, indices in self.species_indices.items()
-        }
+
     
     def __len__(self):
         """Return the number of batches per epoch."""
-        cells_in_largest = max(self.n_cells_per_species.values())
+        cells_in_largest = len(self.epoch_data[self.largest_species])
         batches_for_largest = int(np.ceil(cells_in_largest / self.batch_size))
         len_multiplier = len(self.species_names) * (len(self.species_names) - 1) // 2 if self.yield_pairwise else 1
         return batches_for_largest * len_multiplier
@@ -173,21 +241,22 @@ class CrossSpeciesDataModule(pl.LightningDataModule):
         val_split: float = 0.1,
         test_split: float = 0.1,
         yield_pairwise: bool = False,
+        subsample_size: Optional[int] = None,
+        subsample_by: Optional[Dict[str, str]] = None,
     ):
         """
         Initialize data module.
 
         Args:
-            species_data: Dictionary mapping species to data, where data can be:
-                - A single AnnData object
-                - A single file path (string) to h5ad file
-                - List of AnnData objects
-                - List of file paths to h5ad files
+            species_data: Dictionary mapping species to data
             batch_size: Batch size for dataloaders
             num_workers: Number of workers for dataloaders
             val_split: Fraction of data to use for validation
             test_split: Fraction of data to use for testing
-            seed: Random seed for reproducibility
+            yield_pairwise: Whether to yield pairwise combinations of species
+            subsample_size: If provided, subsample each species to this number of cells
+            subsample_by: If provided, dictionary mapping species to column names in obs metadata
+                         for stratified subsampling
         """
         super().__init__()
         self.species_data = species_data
@@ -195,11 +264,13 @@ class CrossSpeciesDataModule(pl.LightningDataModule):
         self.num_workers = num_workers
         self.val_split = val_split
         self.test_split = test_split
+        self.yield_pairwise = yield_pairwise
+        self.subsample_size = subsample_size
+        self.subsample_by = subsample_by
 
         self.train_dataset = None
         self.val_dataset = None
         self.test_dataset = None
-        self.yield_pairwise = yield_pairwise
 
     def _load_species_data(self, data):
         """Load and concatenate data for a single species."""
@@ -215,13 +286,7 @@ class CrossSpeciesDataModule(pl.LightningDataModule):
                 species_adata = ad.concat(data) if len(data) > 1 else data[0]
             else:
                 species_adata = data
-        
-        # Remove expression data from raw and layers and convert to sparse
-        del species_adata.raw
-        del species_adata.layers
-        if not sp.sparse.issparse(species_adata.X):
-            species_adata.X = sp.sparse.csr_matrix(species_adata.X)
-            
+                    
         return species_adata
 
     def _split_species_data(self, adata, train_frac=0.8, val_frac=0.1, test_frac=0.1):
@@ -241,14 +306,13 @@ class CrossSpeciesDataModule(pl.LightningDataModule):
     def setup(self, stage: Optional[str] = None):
         """Set up datasets for each stage."""
         # Load and split data for each species
-        train_data = {}
-        val_data = {}
-        test_data = {}
+        train_data_idx = {}
+        val_data_idx = {}
+        test_data_idx = {}
         
         for species, data in self.species_data.items():
             # Load data for this species
             species_adata = self._load_species_data(data)
-            species_adata.obs["species"] = species
             
             # Split the data
             train_frac = 1.0 - self.val_split - self.test_split
@@ -260,29 +324,38 @@ class CrossSpeciesDataModule(pl.LightningDataModule):
             )
             
             # Create split datasets
-            train_data[species] = species_adata[train_idx].copy()
-            val_data[species] = species_adata[val_idx].copy()
-            test_data[species] = species_adata[test_idx].copy()
+            train_data_idx[species] = train_idx
+            val_data_idx[species] = val_idx
+            test_data_idx[species] = test_idx
         
         
         if stage == "fit" or stage is None:
             self.train_dataset = CrossSpeciesDataset(
-                species_data=train_data,
+                species_data=self.species_data,
+                species_indices=train_data_idx,
                 batch_size=self.batch_size,
                 yield_pairwise=self.yield_pairwise,
+                subsample_size=self.subsample_size,
+                subsample_by=self.subsample_by,
             )
             
             self.val_dataset = CrossSpeciesDataset(
-                species_data=val_data,
+                species_data=self.species_data,
+                species_indices=val_data_idx,
                 batch_size=self.batch_size,
                 yield_pairwise=self.yield_pairwise,
+                subsample_size=self.subsample_size,
+                subsample_by=self.subsample_by,
             )
 
         if stage == "test" or stage is None:
             self.test_dataset = CrossSpeciesDataset(
-                species_data=test_data,
+                species_data=self.species_data,
+                species_indices=test_data_idx,
                 batch_size=self.batch_size,
                 yield_pairwise=self.yield_pairwise,
+                subsample_size=self.subsample_size,
+                subsample_by=self.subsample_by,
             )
         
 
@@ -292,6 +365,8 @@ class CrossSpeciesDataModule(pl.LightningDataModule):
             self.train_dataset,
             batch_size=None,
             num_workers=self.num_workers,
+            pin_memory=True,
+            persistent_workers=True if self.num_workers > 0 else False
         )
 
     def val_dataloader(self):
@@ -300,6 +375,8 @@ class CrossSpeciesDataModule(pl.LightningDataModule):
             self.val_dataset,
             batch_size=None,
             num_workers=self.num_workers,
+            pin_memory=True,
+            persistent_workers=True if self.num_workers > 0 else False
         )
 
     def test_dataloader(self):
@@ -308,6 +385,8 @@ class CrossSpeciesDataModule(pl.LightningDataModule):
             self.test_dataset,
             batch_size=None,
             num_workers=self.num_workers,
+            pin_memory=True,
+            persistent_workers=True if self.num_workers > 0 else False
         )
 
     @property
@@ -361,11 +440,8 @@ class CrossSpeciesInferenceDataset(IterableDataset):
 
     def _create_batch(self, species: str, indices: np.ndarray):
         """Create a BatchData batch from indices."""
-        species_adata = self.species_data[species]
-        
-        # Get batch data
-        batch_data = species_adata[indices]        
-        return torch.from_numpy(batch_data.X.toarray() if sp.sparse.issparse(batch_data.X) else batch_data.X)
+        species_adata = self.species_data[species]     
+        return torch.from_numpy(species_adata.X[indices].toarray())
 
     def __iter__(self):
         """Iterate through all cells in each species sequentially."""
