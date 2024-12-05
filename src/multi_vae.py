@@ -119,7 +119,7 @@ class CrossSpeciesVAE(pl.LightningModule):
             lr=self.learning_rate,
             weight_decay=0.01,
         )
-
+        
         def lr_lambda(current_step: int):
             if self.warmup_steps is None:
                 return 1.0

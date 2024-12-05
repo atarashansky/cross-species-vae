@@ -67,7 +67,7 @@ class CrossSpeciesDataset(IterableDataset):
         
         # Stratified subsampling
         adata = self.species_data[species]
-        labels = adata.obs[self.subsample_by[species]][indices]
+        labels = adata.obs[self.subsample_by[species]].iloc[indices]
         unique_labels, counts = np.unique(labels, return_counts=True)
         
         # Calculate target size for each label
@@ -128,13 +128,9 @@ class CrossSpeciesDataset(IterableDataset):
         }
         
         # Subset AnnData objects for the epoch and create new indices
-        self.epoch_data = {}
-        self.epoch_indices = {}
-        for species, indices in available_indices.items():
-            # Subset the AnnData
-            self.epoch_data[species] = self.species_data[species][indices].copy()
-            # Create new sequential indices for the subsetted data
-            self.epoch_indices[species] = np.arange(len(indices))
+        self.epoch_data = self.species_data
+        self.epoch_indices = available_indices
+        self.n_cells_per_species = {k: len(v) for k, v in available_indices.items()}
         
         self.seen_largest_dataset = set()
         
@@ -171,7 +167,7 @@ class CrossSpeciesDataset(IterableDataset):
                 self.seen_largest_dataset.update(selected_idx)
             
             # Use indices within range of epoch_data
-            max_idx = len(self.epoch_data[species]) - 1
+            max_idx = self.n_cells_per_species[species] - 1
             selected_idx = np.concatenate([
                 selected_idx,
                 self.rng.choice(
@@ -185,7 +181,7 @@ class CrossSpeciesDataset(IterableDataset):
 
     def _epoch_finished(self):
         """Check if we've seen all cells from the largest dataset."""
-        return len(self.seen_largest_dataset) >= len(self.epoch_data[self.largest_species])
+        return len(self.seen_largest_dataset) >= self.n_cells_per_species[self.largest_species]
 
     def _create_batch(self, indices):
         """Create batch from pre-subsetted epoch data."""
@@ -202,7 +198,7 @@ class CrossSpeciesDataset(IterableDataset):
     
     def __len__(self):
         """Return the number of batches per epoch."""
-        cells_in_largest = len(self.epoch_data[self.largest_species])
+        cells_in_largest = self.n_cells_per_species[self.largest_species]
         batches_for_largest = int(np.ceil(cells_in_largest / self.batch_size))
         len_multiplier = len(self.species_names) * (len(self.species_names) - 1) // 2 if self.yield_pairwise else 1
         return batches_for_largest * len_multiplier
