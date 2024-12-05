@@ -216,6 +216,9 @@ class CrossSpeciesDataset(IterableDataset):
                 species_idx = self.species_to_idx[species]
                 data[species_idx] = self._create_batch(indices)
             
+            if len(indices) < self.batch_size:
+                break
+                        
             if self.yield_pairwise:
                 for i in range(len(data)):
                     for j in range(i + 1, len(data)):
@@ -361,8 +364,8 @@ class CrossSpeciesDataModule(pl.LightningDataModule):
             self.train_dataset,
             batch_size=None,
             num_workers=self.num_workers,
-            pin_memory=True,
-            persistent_workers=True if self.num_workers > 0 else False
+            # pin_memory=True,
+            # persistent_workers=True if self.num_workers > 0 else False
         )
 
     def val_dataloader(self):
@@ -371,8 +374,9 @@ class CrossSpeciesDataModule(pl.LightningDataModule):
             self.val_dataset,
             batch_size=None,
             num_workers=self.num_workers,
-            pin_memory=True,
-            persistent_workers=True if self.num_workers > 0 else False
+            # pin_memory=True,
+            # persistent_workers=True if self.num_workers > 0 else False,
+            # drop_last=True
         )
 
     def test_dataloader(self):
@@ -381,8 +385,8 @@ class CrossSpeciesDataModule(pl.LightningDataModule):
             self.test_dataset,
             batch_size=None,
             num_workers=self.num_workers,
-            pin_memory=True,
-            persistent_workers=True if self.num_workers > 0 else False
+            # pin_memory=True,
+            # persistent_workers=True if self.num_workers > 0 else False
         )
 
     @property

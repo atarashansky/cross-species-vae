@@ -33,6 +33,7 @@ class CrossSpeciesVAE(pl.LightningModule):
         gradient_clip_algorithm: str = "norm",
         recon_weight: float = 1.0,
         homology_weight: float = 1.0,
+        cycle_weight: float = 1.0,
     ):
         super().__init__()
         self.save_hyperparameters(ignore=['homology_edges', 'homology_scores'])
@@ -45,6 +46,7 @@ class CrossSpeciesVAE(pl.LightningModule):
                     
         self.recon_weight = recon_weight
         self.homology_weight = homology_weight
+        self.cycle_weight = cycle_weight
         self.init_beta = init_beta
         self.final_beta = final_beta
         self.current_beta = init_beta  # Track current beta value
@@ -184,7 +186,7 @@ class CrossSpeciesVAE(pl.LightningModule):
         return beta
     
 
-    def training_step(self, batch: BatchData, batch_idx: int):
+    def training_step(self, batch: BatchData, batch_idx: int):     
         # Forward pass
         outputs = self(batch)
         
@@ -192,11 +194,12 @@ class CrossSpeciesVAE(pl.LightningModule):
         loss_dict = self.compute_loss(batch, outputs)
         
         # Log metrics
-        self.log("train_loss", loss_dict["loss"].detach(), sync_dist=True, on_step=False, on_epoch=True)
-        self.log("train_recon", loss_dict["recon"].detach(), sync_dist=True, on_step=False, on_epoch=True)
-        self.log("train_kl", loss_dict["kl"].detach(), sync_dist=True, on_step=False, on_epoch=True)
-        self.log("train_homology", loss_dict["homology"].detach(), sync_dist=True, on_step=False, on_epoch=True)
-        self.log("train_cycle", loss_dict["cycle"].detach(), sync_dist=True, on_step=False, on_epoch=True)
+        self.log("train_loss", loss_dict["loss"].detach(), sync_dist=True)
+        self.log("train_direct_recon", loss_dict["direct_recon"].detach(), sync_dist=True)
+        self.log("train_cross_species_recon", loss_dict["cross_species_recon"].detach(), sync_dist=True)
+        self.log("train_kl", loss_dict["kl"].detach(), sync_dist=True)
+        self.log("train_homology", loss_dict["homology"].detach(), sync_dist=True)
+        self.log("train_cycle", loss_dict["cycle"].detach(), sync_dist=True)
 
         return loss_dict["loss"]
         
@@ -211,12 +214,14 @@ class CrossSpeciesVAE(pl.LightningModule):
         # Store only the scalar values, detached from computation graph
         self.validation_step_outputs.append({
             "val_loss": loss_dict["loss"].detach(),
-            "val_recon": loss_dict["recon"].detach(),
+            "val_direct_recon": loss_dict["direct_recon"].detach(),
+            "val_cross_species_recon": loss_dict["cross_species_recon"].detach(),
             "val_kl": loss_dict["kl"].detach(),
             "val_homology": loss_dict["homology"].detach(),
             "val_cycle": loss_dict["cycle"].detach(),
         })
         
+                        
         return loss_dict["loss"]
 
     def on_validation_epoch_end(self):
@@ -256,6 +261,10 @@ class CrossSpeciesVAE(pl.LightningModule):
             4. Compare original and re-encoded representations
         """
         cycle_loss = torch.tensor(0.0, device=self.device)
+
+        if not hasattr(self, 'homology_scores'):
+            return cycle_loss
+        
         counter = 0
         
         for src_species_id in batch.data:
@@ -287,11 +296,14 @@ class CrossSpeciesVAE(pl.LightningModule):
 
                 counter += 1
         
-        return cycle_loss / counter   
+        return self.cycle_weight * cycle_loss / counter   
     
     def _compute_homology_loss(self, outputs: Dict[int, Any], batch: BatchData) -> torch.Tensor:   
-
         homology_loss = torch.tensor(0.0, device=self.device)
+
+        if not hasattr(self, 'homology_scores'):
+            return homology_loss
+        
         counter = 0
         # Compute homology loss across species pairs
         for src_species_id in batch.data:
@@ -332,7 +344,7 @@ class CrossSpeciesVAE(pl.LightningModule):
         return self.homology_weight * homology_loss / counter
 
 
-    def _compute_reconstruction_loss(
+    def _compute_direct_reconstruction_loss(
         self,
         outputs: Dict[str, Any],
         batch: BatchData,
@@ -346,10 +358,40 @@ class CrossSpeciesVAE(pl.LightningModule):
             
             target_counts = batch.data[target_species_id]
             target_counts = torch.exp(target_counts) - 1
-            nonzero_fraction = (target_counts > 0).float().mean()        
             target_norm = target_counts / target_counts.sum(dim=1, keepdim=True) * 10_000                  
 
-            for _, recon in reconstructions.items():
+            pred_counts = torch.exp(reconstructions[target_species_id]['mean']) - 1
+            pred_norm = pred_counts / pred_counts.sum(dim=1, keepdim=True) * 10_000            
+            
+            count_loss_nb += negative_binomial_loss(
+                pred=pred_norm.clamp(min=1e-6),
+                target=target_norm,
+                theta=reconstructions[target_species_id]['theta'],
+            )
+            counter += 1
+            
+        return self.recon_weight * count_loss_nb / counter
+    
+    def _compute_cross_species_reconstruction_loss(
+        self,
+        outputs: Dict[str, Any],
+        batch: BatchData,
+    ) -> torch.Tensor:
+    
+        count_loss_nb = torch.tensor(0.0, device=self.device)
+        counter = 0
+        
+        for target_species_id in outputs:
+            reconstructions = outputs[target_species_id]['reconstructions']
+            
+            target_counts = batch.data[target_species_id]
+            target_counts = torch.exp(target_counts) - 1
+            target_norm = target_counts / target_counts.sum(dim=1, keepdim=True) * 10_000                  
+
+            for dst_species_id, recon in reconstructions.items():
+                if dst_species_id == target_species_id:
+                    continue
+                
                 pred_counts = torch.exp(recon['mean']) - 1
                 pred_norm = pred_counts / pred_counts.sum(dim=1, keepdim=True) * 10_000            
                 
@@ -360,7 +402,7 @@ class CrossSpeciesVAE(pl.LightningModule):
                 )
                 counter += 1
     
-        return self.recon_weight * count_loss_nb * (1 - nonzero_fraction) / counter
+        return self.recon_weight * count_loss_nb / counter
     
     def _compute_kl_loss(
         self,
@@ -376,7 +418,12 @@ class CrossSpeciesVAE(pl.LightningModule):
             for _, enc_output in encoder_outputs.items():
                 mu = enc_output['mu']
                 logvar = enc_output['logvar']
-                kl += -0.5 * torch.mean(1 + logvar - mu.pow(2).clamp(max=100) - logvar.exp().clamp(max=100))
+                
+                # Add numerical stability clamps
+                logvar = torch.clamp(logvar, min=-20, max=20)  # Prevent extreme values
+                mu = torch.clamp(mu, min=-20, max=20)  # Prevent extreme values
+                
+                kl += -0.5 * torch.mean(1 + logvar - mu.pow(2) - logvar.exp())
                 counter += 1
                 
         return kl / counter
@@ -384,7 +431,8 @@ class CrossSpeciesVAE(pl.LightningModule):
 
 
     def compute_loss(self, batch: BatchData, outputs: Dict[str, Any]) -> Dict[str, torch.Tensor]:
-        recon_loss = self._compute_reconstruction_loss(outputs, batch)
+        direct_recon_loss = self._compute_direct_reconstruction_loss(outputs, batch)
+        cross_species_recon_loss = self._compute_cross_species_reconstruction_loss(outputs, batch)
         
         kl = self._compute_kl_loss(outputs)
 
@@ -394,11 +442,12 @@ class CrossSpeciesVAE(pl.LightningModule):
         
 
         beta = self.get_current_beta()
-        total_loss = recon_loss + kl * beta + homology_loss + beta * cycle_loss
+        total_loss = direct_recon_loss + cross_species_recon_loss + homology_loss + cycle_loss + beta * kl
         
         return {
             "loss": total_loss,
-            "recon": recon_loss,
+            "direct_recon": direct_recon_loss,
+            "cross_species_recon": cross_species_recon_loss,
             "kl": kl,
             "homology": homology_loss,
             "cycle": cycle_loss,
@@ -424,7 +473,7 @@ class CrossSpeciesVAE(pl.LightningModule):
         )
         transform_matrix[edges[:, 1], edges[:, 0]] = scores
         # Normalize transform matrix so src edges sum to 1.0 per dst gene
-        transform_matrix = transform_matrix / (transform_matrix.sum(dim=1, keepdim=True) + 1e-8)
+        transform_matrix = transform_matrix / (transform_matrix.sum(dim=1, keepdim=True).clamp(min=1e-3))
 
         x = batch.data[src_species]
 
@@ -440,23 +489,30 @@ class CrossSpeciesVAE(pl.LightningModule):
         for source_species_id, source_data in batch.data.items():
             # For each source species (A, B, C)            
             reconstructions = {}
+            homology_reconstructions = {}
             encoder_outputs = {}
                         
             source_encoder = self.encoders[str(source_species_id)]
             source_encoded = source_encoder(source_data)
             encoder_outputs[source_species_id] = source_encoded
             
-            for target_species_id in self.species_vocab_sizes.keys():
-                if target_species_id == source_species_id:
-                    continue
+            if hasattr(self, 'homology_scores'):
+                for target_species_id in self.species_vocab_sizes.keys():
+                    if target_species_id == source_species_id:
+                        continue
+                        
+                    # Transform source data to target space
+                    transformed = self._transform_expression(batch, source_species_id, target_species_id)
                     
-                # Transform source data to target space
-                transformed = self._transform_expression(batch, source_species_id, target_species_id)
+                    # Encode transformed data with target encoder
+                    target_encoder = self.encoders[str(target_species_id)]
+                    transformed_encoded = target_encoder(transformed)
+                    encoder_outputs[target_species_id] = transformed_encoded
+
                 
-                # Encode transformed data with target encoder
-                target_encoder = self.encoders[str(target_species_id)]
-                transformed_encoded = target_encoder(transformed)
-                encoder_outputs[target_species_id] = transformed_encoded
+                for dst_species_id in self.species_vocab_sizes.keys():
+                    homology_reconstructions[dst_species_id] = self.decoders[str(dst_species_id)](encoder_outputs[source_species_id]['z'])
+                                                
             
             source_decoder = self.decoders[str(source_species_id)]
             # Now decode using concatenated latents for each target space
@@ -464,10 +520,7 @@ class CrossSpeciesVAE(pl.LightningModule):
                 # Decode with target decoder using all latents
                 reconstructions[target_species_id] = source_decoder(encoder_outputs[target_species_id]['z'])
             
-            homology_reconstructions = {}
-            for dst_species_id in self.species_vocab_sizes.keys():
-                homology_reconstructions[dst_species_id] = self.decoders[str(dst_species_id)](encoder_outputs[source_species_id]['z'])
-                        
+
             results[source_species_id] = {
                 'encoder_outputs': encoder_outputs,
                 'reconstructions': reconstructions,

@@ -69,8 +69,11 @@ class Encoder(nn.Module):
         h = self.encoder(x + self.gene_importance(x))
         mu = self.mu(h)
         logvar = self.logvar(h)
-        z = self.reparameterize(mu, logvar)
+
+        mu = torch.clamp(mu, min=-20, max=20)
+        logvar = torch.clamp(logvar, min=-20, max=20)
         
+        z = self.reparameterize(mu, logvar)
         
         return {
             'z': z,
