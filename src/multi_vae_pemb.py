@@ -9,7 +9,7 @@ from torch.nn import functional as F
 from src.dataclasses import BatchData
 from src.data import CrossSpeciesInferenceDataset
 from src.utils import negative_binomial_loss
-from src.modules import Encoder, Decoder
+from src.modules import Encoder, Decoder, FrozenEmbedding
 
 class CrossSpeciesVAE(pl.LightningModule):
     """Cross-species VAE with multi-scale encoding and species-specific components."""
@@ -19,6 +19,7 @@ class CrossSpeciesVAE(pl.LightningModule):
         species_vocab_sizes: Dict[int, int],
         homology_edges: Dict[int, Dict[int, torch.Tensor]] | None = None,
         homology_scores: Dict[int, Dict[int, torch.Tensor]] | None = None,
+        embedding_weights: Dict[int, torch.Tensor] | None = None,
         n_latent: int = 256,
         hidden_dims: list = [256],
         dropout_rate: float = 0.2,
@@ -38,7 +39,7 @@ class CrossSpeciesVAE(pl.LightningModule):
         transform_weight: float = 0.1,
     ):
         super().__init__()
-        self.save_hyperparameters(ignore=['homology_edges', 'homology_scores'])
+        self.save_hyperparameters(ignore=['homology_edges', 'homology_scores', 'embedding_weights'])
         
         # Scale learning rate based on batch size
         self.learning_rate = base_learning_rate
@@ -60,7 +61,7 @@ class CrossSpeciesVAE(pl.LightningModule):
 
         self.mu_layer = nn.Linear(hidden_dims[-1], n_latent)
         self.logvar_layer = nn.Linear(hidden_dims[-1], n_latent)
-                
+        
         # Create species-specific encoders/decoders
         self.encoders = nn.ModuleDict({
             str(species_id): Encoder(
@@ -68,11 +69,12 @@ class CrossSpeciesVAE(pl.LightningModule):
                 mu_layer=self.mu_layer,
                 logvar_layer=self.logvar_layer,
                 hidden_dims=hidden_dims,
+                embedding=FrozenEmbedding(embedding_weights[species_id]) if embedding_weights is not None else None,
                 dropout_rate=dropout_rate
             )
             for species_id, vocab_size in species_vocab_sizes.items()
         })
-    
+
         self.decoders = nn.ModuleDict({
             str(species_id): Decoder(
                 n_genes=vocab_size,
@@ -283,7 +285,7 @@ class CrossSpeciesVAE(pl.LightningModule):
     ) -> torch.Tensor:
         transform_loss = torch.tensor(0.0, device=self.device)
 
-        if not hasattr(self, 'homology_scores') or self.transform_weight == 0.0:
+        if self.transform_weight == 0.0:
             return transform_loss
         
         counter = 0
@@ -450,7 +452,7 @@ class CrossSpeciesVAE(pl.LightningModule):
     
         count_loss_nb = torch.tensor(0.0, device=self.device)
 
-        if not hasattr(self, 'homology_scores') or self.cross_species_recon_weight == 0.0:
+        if self.cross_species_recon_weight == 0.0:
             return count_loss_nb
         
         counter = 0
@@ -566,42 +568,32 @@ class CrossSpeciesVAE(pl.LightningModule):
         for source_species_id, source_data in batch.data.items():
             # For each source species (A, B, C)            
             reconstructions = {}
-            homology_reconstructions = {}
             encoder_outputs = {}
                         
             source_encoder = self.encoders[str(source_species_id)]
-            source_encoded = source_encoder(source_data)
-            encoder_outputs[source_species_id] = source_encoded
-            
-            if hasattr(self, 'homology_scores'):
-                for target_species_id in self.species_vocab_sizes.keys():
-                    if target_species_id == source_species_id:
-                        continue
-                        
-                    # Transform source data to target space
-                    transformed = self._transform_expression(batch, source_species_id, target_species_id)
-                    
-                    # Encode transformed data with target encoder
-                    target_encoder = self.encoders[str(target_species_id)]
-                    transformed_encoded = target_encoder(transformed)
-                    encoder_outputs[target_species_id] = transformed_encoded
+            source_embedded = source_encoder.embed(source_data)
+            source_outputs = source_encoder.encode(source_embedded)
+            encoder_outputs[source_species_id] = source_outputs
 
-                if self.homology_weight > 0.0 or self.cycle_weight > 0.0:
-                    for dst_species_id in self.species_vocab_sizes.keys():
-                        homology_reconstructions[dst_species_id] = self.decoders[str(dst_species_id)](encoder_outputs[source_species_id]['z'])
-                                                
+            
+            for target_species_id in self.species_vocab_sizes.keys():
+                if target_species_id == source_species_id:
+                    continue
+                                        
+                # Encode transformed data with target encoder
+                target_encoder = self.encoders[str(target_species_id)]
+                target_encoded = target_encoder.encode(source_embedded)
+                encoder_outputs[target_species_id] = target_encoded
+                 
             
             source_decoder = self.decoders[str(source_species_id)]
-            # Now decode using concatenated latents for each target space
             for target_species_id in self.species_vocab_sizes.keys():
-                # Decode with target decoder using all latents
                 reconstructions[target_species_id] = source_decoder(encoder_outputs[target_species_id]['z'])
             
 
             results[source_species_id] = {
                 'encoder_outputs': encoder_outputs,
                 'reconstructions': reconstructions,
-                'homology_reconstructions': homology_reconstructions,
             }
         return results
 
