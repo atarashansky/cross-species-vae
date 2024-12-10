@@ -32,7 +32,7 @@ class FrozenEmbedding(nn.Module):
         with torch.no_grad():
             self.linear = nn.Linear(embedding_weights.shape[0], embedding_weights.shape[1], bias=False)
             self.linear.weight.copy_(embedding_weights.T)
-        self.linear.weight.requires_grad = False
+
         
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.linear(x)
