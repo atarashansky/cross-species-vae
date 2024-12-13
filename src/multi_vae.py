@@ -5,6 +5,7 @@ import torch
 from torch import cuda
 import numpy as np
 import math
+import hnswlib
 import torch.nn as nn
 from torch.nn import functional as F
 from src.dataclasses import BatchData
@@ -27,9 +28,11 @@ class CrossSpeciesVAE(pl.LightningModule):
         base_batch_size: int = 256,
         batch_size: int = 256,
         min_learning_rate: float = 1e-5,
-        warmup_data: float = 5.0,
+        warmup_data: float = 0.1,
         init_beta: float = 1e-3,
         final_beta: float = 1,
+        triplet_epoch_start: float = 0.5,
+        triplet_loss_margin: float = 0.2,
         gradient_clip_val: float = 1.0,
         gradient_clip_algorithm: str = "norm",
         direct_recon_weight: float = 1.0,
@@ -50,6 +53,8 @@ class CrossSpeciesVAE(pl.LightningModule):
         self.current_beta = init_beta  # Track current beta value
         self.base_batch_size = base_batch_size
         self.batch_size = batch_size
+        self.triplet_loss_margin = triplet_loss_margin
+        self.triplet_epoch_start = triplet_epoch_start
         self.homology_score_momentum = homology_score_momentum
         
         # Store parameters
@@ -251,7 +256,8 @@ class CrossSpeciesVAE(pl.LightningModule):
         
         # Compute losses
         loss_dict = self.compute_loss(batch, outputs)
-        self._update_correlation_estimates(batch, outputs)
+        if batch.triplets is None and batch.data is not None:
+            self._update_correlation_estimates(batch, outputs)
         
         # Log metrics
         self.log("train_loss", loss_dict["loss"].detach(), sync_dist=True)
@@ -259,6 +265,7 @@ class CrossSpeciesVAE(pl.LightningModule):
         self.log("train_cross_species_recon", loss_dict["cross_species_recon"].detach(), sync_dist=True)
         self.log("train_kl", loss_dict["kl"].detach(), sync_dist=True)
         self.log("train_transform", loss_dict["transform"].detach(), sync_dist=True)
+        self.log("train_triplet", loss_dict["triplet"].detach(), sync_dist=True)
 
         return loss_dict["loss"]
         
@@ -277,6 +284,7 @@ class CrossSpeciesVAE(pl.LightningModule):
             "val_cross_species_recon": loss_dict["cross_species_recon"].detach(),
             "val_kl": loss_dict["kl"].detach(),
             "val_transform": loss_dict["transform"].detach(),
+            "val_triplet": loss_dict["triplet"].detach(),
         })
         
                         
@@ -302,7 +310,7 @@ class CrossSpeciesVAE(pl.LightningModule):
         self.prev_gpu_memory = 0
         if cuda.is_available():
             cuda.empty_cache()
-                
+     
         # Reset running statistics
         for src_id in self.species_vocab_sizes.keys():
             for dst_id in self.species_vocab_sizes.keys():
@@ -358,8 +366,7 @@ class CrossSpeciesVAE(pl.LightningModule):
                     
                     # Get current scores
                     scores = getattr(self, f'scores_{src_species_id}_{dst_species_id}')
-                    # breakpoint()
-                    print(np.corrcoef(scores.cpu().numpy(), (self.homology_score_momentum * scores + (1 - self.homology_score_momentum) * new_scores).cpu().numpy())[0,1])
+
                     # Apply momentum update
                     scores.data = self.homology_score_momentum * scores + (1 - self.homology_score_momentum) * new_scores
 
@@ -367,8 +374,111 @@ class CrossSpeciesVAE(pl.LightningModule):
                     scores_symmetric = getattr(self, f'scores_{dst_species_id}_{src_species_id}')
                     scores_symmetric.data = scores.data
         
+        if self.trainer.current_epoch >= self.triplet_epoch_start * self.trainer.max_epochs :
+            self.get_triplets_for_current_epoch()
+
         if cuda.is_available():
             cuda.empty_cache()
+
+
+
+    def get_train_dataset(self):
+        """Get the training dataset from the trainer's datamodule."""
+        if self.trainer is None or self.trainer.datamodule is None:
+            return None
+        return self.trainer.datamodule.train_dataset
+
+    @torch.no_grad()
+    def get_triplets_for_current_epoch(self):
+        """Get triplets for current epoch using latent embeddings."""
+        dataset = self.get_train_dataset()
+        dataset.triplets = None
+
+        latents = {k: [] for k in self.species_vocab_sizes.keys()}
+        labels = {k: [] for k in self.species_vocab_sizes.keys()}
+
+        for batch in dataset:
+            for target_species_id in batch.data:
+                # Move data to same device as model
+                data = batch.data[target_species_id].to(self.device)
+                mu = self.encoders[str(target_species_id)](data)['mu'].cpu()
+                latents[target_species_id].append(mu)
+                labels[target_species_id].append(batch.labels[target_species_id])
+        
+        for target_species_id in latents:
+            latents[target_species_id] = torch.cat(latents[target_species_id], dim=0)
+            labels[target_species_id] = np.concatenate(labels[target_species_id])
+        
+        triplets = {}
+        
+        num_triplets = 0
+        for src_species_id in self.species_vocab_sizes.keys():
+            for dst_species_id in self.species_vocab_sizes.keys():
+                if src_species_id == dst_species_id:
+                    continue
+                
+                valid_anchors, valid_positives, valid_negatives = self._mine_triplets_one_nn(
+                    latents, labels, src_species_id, dst_species_id
+                )
+                
+                triplets[(src_species_id, dst_species_id)] = {
+                    'anchor': valid_anchors,
+                    'positive': valid_positives,
+                    'negative': valid_negatives
+                }
+
+                num_triplets += len(valid_anchors)
+
+        print(f"Found {num_triplets} triplets")
+        dataset.triplets = triplets
+
+    def _mine_triplets_one_nn(self, latents, labels, src_id, dst_id, ef=200, M=48):
+        emb1 = latents[src_id].numpy()
+        emb2 = latents[dst_id].numpy()
+
+        # Get nearest neighbors in emb2 for each cell in emb1
+        labels2 = np.arange(emb2.shape[0])
+        p2 = hnswlib.Index(space='cosine', dim=emb2.shape[1])
+        p2.init_index(max_elements=emb2.shape[0], ef_construction=ef, M=M)
+        p2.add_items(emb2, labels2)
+        p2.set_ef(ef)
+        idx1, _ = p2.knn_query(emb1, k=1)
+        idx1 = idx1.squeeze()
+        # Get nearest neighbors in emb1 for each neighbor of each cell in emb1
+        labels1 = np.arange(emb1.shape[0])
+        p1 = hnswlib.Index(space='cosine', dim=emb1.shape[1])
+        p1.init_index(max_elements=emb1.shape[0], ef_construction=ef, M=M)
+        p1.add_items(emb1, labels1)
+        p1.set_ef(ef)
+        idx2, _ = p1.knn_query(emb2[idx1], k=1)   
+        idx2 = idx2.squeeze()
+
+        # Find positive pairs as labels1[idx2] == labels1
+        valid_pairs = labels[src_id][idx2] == labels[src_id]
+        anchors = np.where(valid_pairs)[0]
+        positives = idx1[anchors]
+
+        valid_negatives = []
+        valid_positives = []
+        valid_anchors = []
+        for anchor_idx, positive_idx in zip(anchors, positives):
+            anchor_label = labels[src_id][anchor_idx]
+            
+            # Find cells in src_species (same as anchor) with different labels
+            neg_candidates = np.where(labels[src_id] != anchor_label)[0]
+            
+            if len(neg_candidates) > 0:
+                # Randomly select one negative example
+                neg_idx = np.random.choice(neg_candidates)
+                valid_negatives.append(neg_idx)   
+                valid_positives.append(positive_idx)
+                valid_anchors.append(anchor_idx)
+        
+        # Anchors: src
+        # Positives: dst
+        # Negatives: src
+        return np.array(valid_anchors), np.array(valid_positives), np.array(valid_negatives)
+
 
     def _compute_transform_consistency_loss(
         self,
@@ -499,10 +609,45 @@ class CrossSpeciesVAE(pl.LightningModule):
                 
         return kl / counter
     
-    def compute_loss(self, batch: BatchData, outputs: Dict[str, Any]) -> Dict[str, torch.Tensor]:
-        direct_recon_loss = self._compute_direct_reconstruction_loss(outputs, batch)
-        cross_species_recon_loss = self._compute_cross_species_reconstruction_loss(outputs, batch)
+    def _compute_triplet_loss(self, outputs: Dict[str, Any]) -> torch.Tensor:
+        """Compute triplet loss with cosine distance.
         
+        Loss = max(D(z_a, z_p) - D(z_a, z_n) + margin, 0)
+        where D is cosine distance: D(x,y) = 1 - cos(x,y)
+        """
+        margin = self.triplet_loss_margin
+        
+        # Get latent vectors
+        z_anchor = outputs["anchor_encoded"]["z"]
+        z_positive = outputs["positive_encoded"]["z"]
+        z_negative = outputs["negative_encoded"]["z"]
+        
+        # Compute cosine distances
+        # Note: cosine_similarity returns values in [-1, 1], so we need 1 - cos to get distance
+        pos_dist = 1 - F.cosine_similarity(z_anchor, z_positive)
+        neg_dist = 1 - F.cosine_similarity(z_anchor, z_negative)
+        
+        # Compute triplet loss
+        loss = torch.clamp(pos_dist - neg_dist + margin, min=0).mean()
+        
+        # Return mean loss over batch
+        return {
+            "loss": loss,
+            "direct_recon": torch.tensor(0.0, device=self.device),
+            "cross_species_recon": torch.tensor(0.0, device=self.device),
+            "kl": torch.tensor(0.0, device=self.device),
+            "transform": torch.tensor(0.0, device=self.device),   
+            "triplet": loss,             
+        }
+    
+    def compute_loss(self, batch: BatchData, outputs: Dict[str, Any]) -> Dict[str, torch.Tensor]:
+        if batch.triplets is not None:
+            return self._compute_triplet_loss(outputs)
+        
+        direct_recon_loss = self._compute_direct_reconstruction_loss(outputs, batch)
+
+        cross_species_recon_loss = self._compute_cross_species_reconstruction_loss(outputs, batch)
+                
         kl = self._compute_kl_loss(outputs)
 
         transform_loss = self._compute_transform_consistency_loss(outputs, batch)
@@ -516,6 +661,7 @@ class CrossSpeciesVAE(pl.LightningModule):
             "cross_species_recon": cross_species_recon_loss,
             "kl": kl,
             "transform": transform_loss,
+            "triplet": torch.tensor(0.0, device=self.device),
         }
     
     @torch.no_grad()
@@ -554,47 +700,64 @@ class CrossSpeciesVAE(pl.LightningModule):
 
    
     def forward(self, batch: BatchData) -> Dict[str, Any]:
-        results = {}
-        
-        for source_species_id, source_data in batch.data.items():
-            # For each source species (A, B, C)            
-            reconstructions = {}
-            homology_reconstructions = {}
-            encoder_outputs = {}
+        results = {}        
+        if batch.data is not None:
+            for source_species_id, source_data in batch.data.items():
+                # For each source species (A, B, C)            
+                reconstructions = {}
+                homology_reconstructions = {}
+                encoder_outputs = {}
+                            
+                source_encoder = self.encoders[str(source_species_id)]
+                source_encoded = source_encoder(source_data)
+                encoder_outputs[source_species_id] = source_encoded
+                
+                if self.homology_available:
+                    for target_species_id in self.species_vocab_sizes.keys():
+                        if target_species_id == source_species_id:
+                            continue
+                            
+                        # Transform source data to target space
+                        transformed = self._transform_expression(batch, source_species_id, target_species_id)
                         
-            source_encoder = self.encoders[str(source_species_id)]
-            source_encoded = source_encoder(source_data)
-            encoder_outputs[source_species_id] = source_encoded
-            
-            if self.homology_available:
+                        # Encode transformed data with target encoder
+                        target_encoder = self.encoders[str(target_species_id)]
+                        transformed_encoded = target_encoder(transformed)
+                        encoder_outputs[target_species_id] = transformed_encoded
+                                                    
+                
+                source_decoder = self.decoders[str(source_species_id)]
+                # Now decode using concatenated latents for each target space
                 for target_species_id in self.species_vocab_sizes.keys():
-                    if target_species_id == source_species_id:
-                        continue
-                        
-                    # Transform source data to target space
-                    transformed = self._transform_expression(batch, source_species_id, target_species_id)
-                    
-                    # Encode transformed data with target encoder
-                    target_encoder = self.encoders[str(target_species_id)]
-                    transformed_encoded = target_encoder(transformed)
-                    encoder_outputs[target_species_id] = transformed_encoded
-                                                
-            
-            source_decoder = self.decoders[str(source_species_id)]
-            # Now decode using concatenated latents for each target space
-            for target_species_id in self.species_vocab_sizes.keys():
-                # Decode with target decoder using all latents
-                reconstructions[target_species_id] = source_decoder(encoder_outputs[target_species_id]['z'])
-            
+                    # Decode with target decoder using all latents
+                    reconstructions[target_species_id] = source_decoder(encoder_outputs[target_species_id]['z'])
+                
 
-            for target_species_id in self.species_vocab_sizes.keys():
-                homology_reconstructions[target_species_id] = self.decoders[str(target_species_id)](encoder_outputs[source_species_id]['mu'])
+                for target_species_id in self.species_vocab_sizes.keys():
+                    homology_reconstructions[target_species_id] = self.decoders[str(target_species_id)](encoder_outputs[source_species_id]['mu'])
 
-            results[source_species_id] = {
-                'encoder_outputs': encoder_outputs,
-                'reconstructions': reconstructions,
-                'homology_reconstructions': homology_reconstructions,
-            }
+                results[source_species_id] = {
+                    'encoder_outputs': encoder_outputs,
+                    'reconstructions': reconstructions,
+                    'homology_reconstructions': homology_reconstructions,
+                }
+        elif batch.triplets is not None:
+            for (src_species_id, dst_species_id), triplet_data in batch.triplets.items():
+                anchor_data = triplet_data['anchor']
+                positive_data = triplet_data['positive']
+                negative_data = triplet_data['negative']
+
+                anchor_encoded = self.encoders[str(src_species_id)](anchor_data)
+                positive_encoded = self.encoders[str(dst_species_id)](positive_data)
+                negative_encoded = self.encoders[str(src_species_id)](negative_data)
+
+                results["anchor_encoded"] = anchor_encoded
+                results["positive_encoded"] = positive_encoded
+                results["negative_encoded"] = negative_encoded
+            
+            results["src_species_id"] = src_species_id
+            results["dst_species_id"] = dst_species_id
+
         return results
 
     @torch.no_grad()

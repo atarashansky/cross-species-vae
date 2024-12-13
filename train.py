@@ -80,7 +80,6 @@ def find_nearest_neighbors(L1, L2, n_neighbors=15, metric='correlation'):
     
     return indices, distances
 
-
 adata1 = anndata.read_h5ad('data/wagner/data.h5ad')
 adata2 = anndata.read_h5ad('data/briggs/data.h5ad')
 
@@ -153,7 +152,7 @@ data_module.setup()
 
 species_data_sub = {k: data_module.train_dataset.epoch_data[k][data_module.train_dataset.epoch_indices[k]].copy() for k in data_module.train_dataset.epoch_data}
 
-batch_size = 256
+batch_size = 512
 
 data_module = CrossSpeciesDataModule(
     species_data = species_data_sub,
@@ -162,6 +161,10 @@ data_module = CrossSpeciesDataModule(
     val_split=0.1,
     test_split=0.1,
     yield_pairwise=False,
+    labels={
+        "wagner": "cell_type",
+        "briggs": "cell_type",
+    }
 )
 data_module.setup()
 
@@ -175,36 +178,41 @@ model = CrossSpeciesVAE(
     homology_edges=homology_edges,
     homology_scores=homology_scores,
     batch_size=batch_size,
-    cross_species_recon_weight=1.0,
     direct_recon_weight=1.0,
-    transform_weight=0.1,
+    cross_species_recon_weight=1.0,
+
+    triplet_epoch_start=0.5,
+    triplet_loss_margin=0.2,
+    
+    transform_weight=0.0, #from 0.1
     base_learning_rate=1e-2,
     min_learning_rate=1e-4,
-    warmup_data=1.0,
+    
+    warmup_data=0.1,
+    homology_score_momentum=0.9,
 )
 
 early_stopping = EarlyStopping(
     monitor='val_loss',
     min_delta=0.0,
-    patience=5,
+    patience=11,
     verbose=True,
     mode='min'
 )
 
 # Initialize the trainer
-
 trainer = pl.Trainer(
     accelerator="gpu",
     devices=1,
-    max_epochs=50,
+    max_epochs=4,
     precision='16-mixed',
     gradient_clip_val=model.gradient_clip_val,
     gradient_clip_algorithm="norm",
     log_every_n_steps=1,
     deterministic=True,
-    callbacks=[early_stopping],
+    callbacks=[],
     accumulate_grad_batches=1,
-    enable_progress_bar=False,
+    enable_progress_bar=True,
     fast_dev_run=False,
     logger=CSVLogger(
         save_dir="logs",

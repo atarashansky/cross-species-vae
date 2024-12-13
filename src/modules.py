@@ -112,20 +112,37 @@ class Decoder(nn.Module):
         super().__init__()
         self.log_theta = nn.Parameter(torch.ones(n_genes) * 2.3)
 
-        # Biological decoder network
+        # Build decoder network
         layers = []
         dims = [n_latent] + hidden_dims + [n_genes]
         
         for i in range(len(dims) - 1):
+            is_last_layer = i == len(dims) - 2
+            
             layers.extend([
                 nn.Linear(dims[i], dims[i + 1]),
-                nn.LayerNorm(dims[i + 1]) if i < len(dims) - 2 else nn.Identity(),
-                nn.ReLU() if i < len(dims) - 2 else nn.Softplus(),
-                nn.Dropout(dropout_rate) if i < len(dims) - 2 else nn.Identity()
+                nn.LayerNorm(dims[i + 1]) if not is_last_layer else nn.Identity(),
+                nn.ReLU() if not is_last_layer else nn.Softplus(),
+                nn.Dropout(dropout_rate) if not is_last_layer else nn.Identity()
             ])
             
-        self.decoder_net = nn.Sequential(*layers)     
-    
+        self.decoder_net = nn.Sequential(*layers)   
+
+        # Initialize weights
+        last_linear = None
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                last_linear = m  # Keep track of the last linear layer we see
+                
+        # Now initialize all layers
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                if m is last_linear:  # Last linear layer
+                    nn.init.xavier_normal_(m.weight, gain=0.01)
+                else:
+                    nn.init.xavier_normal_(m.weight)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
     
     def forward(self, z: torch.Tensor) -> Dict[str, torch.Tensor]:
         return {
