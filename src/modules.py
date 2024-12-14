@@ -44,18 +44,15 @@ class Encoder(nn.Module):
         mu_layer: nn.Linear,
         logvar_layer: nn.Linear,
         hidden_dims: list,
-        embedding: FrozenEmbedding | None = None,
         n_context_hidden: int = 128,
         dropout_rate: float = 0.1,
     ):
         super().__init__()
         
         self.gene_importance = GeneImportanceModule(n_genes, n_context_hidden)        
-        self.embedding = embedding
         
         # Get input dimension for encoder layers
-        input_dim = self.embedding.linear.out_features if embedding is not None else n_genes
-        self.encoder = self._make_encoder_layers(input_dim, hidden_dims, dropout_rate)
+        self.encoder = self._make_encoder_layers(n_genes, hidden_dims, dropout_rate)
         self.mu = mu_layer
         self.logvar = logvar_layer
 
@@ -79,8 +76,7 @@ class Encoder(nn.Module):
     
     def embed(self, x: torch.Tensor) -> torch.Tensor:
         """Transform input to embedding space"""
-        x = self.preprocess(x)
-        return self.embedding(x) if self.embedding is not None else x
+        return self.preprocess(x)
     
     def encode(self, embedded: torch.Tensor) -> Dict[str, torch.Tensor]:
         """Process embedded input through encoder layers"""
@@ -110,43 +106,34 @@ class Decoder(nn.Module):
         dropout_rate: float = 0.1,
     ):
         super().__init__()
-        self.log_theta = nn.Parameter(torch.ones(n_genes) * 2.3)
+
 
         # Build decoder network
-        layers = []
+        def build_decoder_layers(dims: list) -> nn.Sequential:
+            layers = []
+            
+            for i in range(len(dims) - 1):
+                is_last_layer = i == len(dims) - 2
+            
+                layers.extend([
+                    nn.Linear(dims[i], dims[i + 1]),
+                    nn.LayerNorm(dims[i + 1]) if not is_last_layer else nn.Identity(),
+                    nn.ReLU() if not is_last_layer else nn.Softplus(),
+                    nn.Dropout(dropout_rate) if not is_last_layer else nn.Identity()
+                ])
+            
+            return nn.Sequential(*layers)
+        
         dims = [n_latent] + hidden_dims + [n_genes]
         
-        for i in range(len(dims) - 1):
-            is_last_layer = i == len(dims) - 2
-            
-            layers.extend([
-                nn.Linear(dims[i], dims[i + 1]),
-                nn.LayerNorm(dims[i + 1]) if not is_last_layer else nn.Identity(),
-                nn.ReLU() if not is_last_layer else nn.Softplus(),
-                nn.Dropout(dropout_rate) if not is_last_layer else nn.Identity()
-            ])
-            
-        self.decoder_net = nn.Sequential(*layers)   
+        self.decoder_net = build_decoder_layers(dims)
+        self.theta_net = build_decoder_layers(dims)
 
-        # Initialize weights
-        last_linear = None
-        for m in self.modules():
-            if isinstance(m, nn.Linear):
-                last_linear = m  # Keep track of the last linear layer we see
-                
-        # Now initialize all layers
-        for m in self.modules():
-            if isinstance(m, nn.Linear):
-                if m is last_linear:  # Last linear layer
-                    nn.init.xavier_normal_(m.weight, gain=0.01)
-                else:
-                    nn.init.xavier_normal_(m.weight)
-                if m.bias is not None:
-                    nn.init.zeros_(m.bias)
+
     
     def forward(self, z: torch.Tensor) -> Dict[str, torch.Tensor]:
         return {
             'mean': self.decoder_net(z),
-            'theta': torch.exp(self.log_theta)
+            'theta': torch.exp(self.theta_net(z))
         }
     

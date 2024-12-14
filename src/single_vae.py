@@ -1,44 +1,45 @@
-from typing import Dict, Tuple
-import pytorch_lightning as pl
+from typing import Dict, Tuple, Union
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-import math
 
 from src.utils import negative_binomial_loss
 from src.modules import Encoder, Decoder
 from src.multi_vae import CrossSpeciesVAE
 from src.dataclasses import BatchData
 from src.data import CrossSpeciesInferenceDataset
+from src.base_model import BaseModel
 
-class VAE(pl.LightningModule):
+class VAE(BaseModel):
     def __init__(
         self,
         cross_species_vae: CrossSpeciesVAE,
-        n_latent: int = 128,
-        hidden_dims: list = [128],
-        dropout_rate: float = 0.1,
+        n_latent: int = 256,
+        hidden_dims: list = [256],
+        dropout_rate: float = 0.2,
         base_learning_rate: float = 1e-3,
-        base_batch_size: int = 32,
-        batch_size: int | None = None,
+        base_batch_size: int = 256,
+        batch_size: int = 256,
         min_learning_rate: float = 1e-5,
-        warmup_epochs: float = 0.1,
         init_beta: float = 1e-3,
-        final_beta: float = 0.1,
+        final_beta: float = 1.0,
         gradient_clip_val: float = 1.0,
         gradient_clip_algorithm: str = "norm",
+        warmup_data: float = 0.1,
+        deeply_inject_species: bool = False,
     ):
-        super().__init__()
+        super().__init__(
+            base_learning_rate=base_learning_rate,
+            base_batch_size=base_batch_size,
+            batch_size=batch_size,
+            min_learning_rate=min_learning_rate,
+            warmup_data=warmup_data,
+            init_beta=init_beta,
+            final_beta=final_beta,                 
+            gradient_clip_val=gradient_clip_val,
+            gradient_clip_algorithm=gradient_clip_algorithm,               
+        )
+
         self.save_hyperparameters(ignore=['cross_species_vae'])
-        
-        # Training parameters
-        self.min_learning_rate = min_learning_rate
-        self.warmup_epochs = warmup_epochs
-        self.warmup_steps = None
-        self.init_beta = init_beta
-        self.final_beta = final_beta
-        self.gradient_clip_val = gradient_clip_val
-        self.gradient_clip_algorithm = gradient_clip_algorithm
         
         # Store and freeze the VAE
         self.cross_species_vae = cross_species_vae
@@ -49,66 +50,73 @@ class VAE(pl.LightningModule):
         # Calculate input dimension (sum of all species gene spaces)
         self.input_dim = sum(vocab_size for vocab_size in cross_species_vae.species_vocab_sizes.values())
         n_species = len(cross_species_vae.species_vocab_sizes)
-        if batch_size is not None:
-            self.learning_rate = base_learning_rate * (batch_size / base_batch_size)
-        else:
-            self.learning_rate = base_learning_rate
+        
+        self.learning_rate = base_learning_rate
+        self.batch_size = batch_size
+        self.base_batch_size = base_batch_size
         
 
-        self.mu_layer = nn.Linear(hidden_dims[-1], n_latent)
-        self.logvar_layer = nn.Linear(hidden_dims[-1], n_latent)
+        n_species_for_layer = n_species if deeply_inject_species else 0
+        self.mu_layer = nn.Linear(hidden_dims[-1] + n_species_for_layer, n_latent)
+        self.logvar_layer = nn.Linear(hidden_dims[-1] + n_species_for_layer, n_latent)
      
         self.encoder = Encoder(
             n_genes=self.input_dim,
+            n_species=n_species,
             mu_layer=self.mu_layer,
             logvar_layer=self.logvar_layer,
             hidden_dims=hidden_dims,
-            dropout_rate=dropout_rate
+            dropout_rate=dropout_rate,
+            deeply_inject_species=deeply_inject_species,
         )   
 
         self.decoder = Decoder(
             n_genes=self.input_dim,
+            n_species=n_species,
             n_latent=n_latent,
             hidden_dims=hidden_dims[::-1],  # Reverse hidden dims for decoder
             dropout_rate=dropout_rate,
+            deeply_inject_species=deeply_inject_species,
         )
         
         self.validation_step_outputs = []
         
-    def preprocess_batch(self, batch: BatchData) -> torch.Tensor:
+    def preprocess_batch(self, batch: BatchData) -> Tuple[torch.Tensor, torch.Tensor]:
         """Transform batch through CrossSpeciesVAE and concatenate outputs."""
         with torch.no_grad():
             # For each source species
             all_reconstructions = []
+            all_species_ids = []
             
             for source_species_id, source_data in batch.data.items():
                 # Encode source data
                 source_encoder = self.cross_species_vae.encoders[str(source_species_id)]
-                source_encoded = source_encoder(source_data)
+                source_encoded = source_encoder(source_data, source_species_id)
                                 
                 # Decode into all species spaces
                 cell_reconstructions = []
                 for target_species_id in sorted(self.cross_species_vae.species_vocab_sizes.keys()):
                     target_decoder = self.cross_species_vae.decoders[str(target_species_id)]
-                    reconstruction = target_decoder(source_encoded['z'])
+                    reconstruction = target_decoder(source_encoded['z'], target_species_id)
                     cell_reconstructions.append(reconstruction['mean'])
                 
                 # Concatenate all target species reconstructions
                 concatenated = torch.cat(cell_reconstructions, dim=1)
                 all_reconstructions.append(concatenated)
+                all_species_ids.append(torch.full((concatenated.shape[0], ), source_species_id, dtype=torch.long, device=self.device))
                         
-            return torch.cat(all_reconstructions, dim=0)
+            return torch.cat(all_reconstructions, dim=0), torch.cat(all_species_ids, dim=0)
     
-    def encode(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
-        return self.encoder(x)
+    def encode(self, x: torch.Tensor, species_id: torch.Tensor | int) -> Dict[str, torch.Tensor]:
+        return self.encoder(x, species_id)
         
-    def decode(self, z: torch.Tensor) -> Dict[str, torch.Tensor]:
-        return self.decoder(z)
+    def decode(self, z: torch.Tensor, species_id: torch.Tensor | int) -> Dict[str, torch.Tensor]:
+        return self.decoder(z, species_id)
         
-    def forward(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
+    def forward(self, x: torch.Tensor, species_id: torch.Tensor | int) -> Dict[str, torch.Tensor]:
         # Full forward pass
-        encoded = self.encode(x)
-        decoded = self.decode(encoded['z'])
+        encoded = self.encode(x, species_id)
+        decoded = self.decode(encoded['z'], species_id)
         
         return {
             **encoded,
@@ -137,10 +145,10 @@ class VAE(pl.LightningModule):
     
     def training_step(self, batch: BatchData, batch_idx: int) -> torch.Tensor:
         # Preprocess batch through frozen VAE
-        x = self.preprocess_batch(batch)
+        x, species_ids = self.preprocess_batch(batch)
         
         # Forward pass through SCVI
-        outputs = self(x)
+        outputs = self(x, species_ids)
         
         # Compute losses
         recon_loss = self._compute_reconstruction_loss(
@@ -169,10 +177,10 @@ class VAE(pl.LightningModule):
     
     def validation_step(self, batch: BatchData, batch_idx: int) -> torch.Tensor:
         # Preprocess batch through frozen VAE
-        x = self.preprocess_batch(batch)
+        x, species_ids = self.preprocess_batch(batch)
         
         # Forward pass through SCVI
-        outputs = self(x)
+        outputs = self(x, species_ids)
         
         # Compute losses
         recon_loss = self._compute_reconstruction_loss(
@@ -198,58 +206,6 @@ class VAE(pl.LightningModule):
         
         return total_loss
     
-    def on_validation_epoch_end(self):
-        """Compute average validation metrics at epoch end."""
-        if not self.validation_step_outputs:
-            return
-        
-        # Calculate mean of all metrics
-        metrics = {
-            key: torch.stack([x[key] for x in self.validation_step_outputs]).mean()
-            for key in self.validation_step_outputs[0].keys()
-        }
-        
-        # Log averaged metrics
-        for key, value in metrics.items():
-            self.log(key, value, sync_dist=True)
-        
-        # Clear saved outputs
-        self.validation_step_outputs.clear()
-    
-    def configure_optimizers(self):
-        optimizer = torch.optim.AdamW(
-            self.parameters(),
-            lr=self.learning_rate,
-            weight_decay=0.01,
-        )
-
-        def lr_lambda(current_step: int):
-            if self.warmup_steps is None:
-                return 1.0
-            
-            if current_step < self.warmup_steps:
-                # Linear warmup
-                return float(current_step) / float(max(1, self.warmup_steps))
-            else:
-                # Cosine decay with minimum learning rate
-                progress = float(current_step - self.warmup_steps) / float(
-                    max(1, self.trainer.estimated_stepping_batches - self.warmup_steps)
-                )
-                return max(
-                    self.min_learning_rate / self.learning_rate,
-                    0.5 * (1.0 + math.cos(math.pi * progress)),
-                )
-
-        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
-
-        return {
-            "optimizer": optimizer,
-            "lr_scheduler": {
-                "scheduler": scheduler,
-                "interval": "step",
-                "frequency": 1,
-            },
-        }
 
     @torch.no_grad()
     def get_latent_embeddings(
@@ -257,7 +213,7 @@ class VAE(pl.LightningModule):
         species_data,
         batch_size: int = 512,
         device = "cuda",
-    ) -> torch.Tensor:
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         """
         Get latent embeddings for cells in provided AnnData objects.
         
@@ -282,51 +238,20 @@ class VAE(pl.LightningModule):
         # Set to evaluation mode
         self.eval()
         all_latents = []
-        
+        all_species_ids = []
         for batch in dataset:
             # Move batch to device and preprocess through VAE
             batch = BatchData(
                 data={k: v.to(device) for k,v in batch.data.items()},
             )
-            x = self.preprocess_batch(batch)
+            x, species_ids = self.preprocess_batch(batch)
             
             # Get latent representation from encoder
-            encoded = self.encode(x)
+            encoded = self.encode(x, species_ids)
             all_latents.append(encoded['z'].cpu())
+            all_species_ids.append(species_ids.cpu())        
         
         # Concatenate all batches
         latents = torch.cat(all_latents, dim=0)
-        return latents
-
-    def on_train_start(self):
-        """Calculate warmup steps when training starts."""
-        if self.warmup_steps is None:
-            steps_per_epoch = len(self.trainer.train_dataloader)
-            self.warmup_steps = int(steps_per_epoch * self.warmup_epochs)
-
-    def configure_gradient_clipping(
-        self, optimizer, gradient_clip_val=None, gradient_clip_algorithm=None
-    ):
-        """Configure gradient clipping with improved settings."""
-        gradient_clip_val = gradient_clip_val or self.gradient_clip_val
-        gradient_clip_algorithm = gradient_clip_algorithm or self.gradient_clip_algorithm
-
-        self.clip_gradients(
-            optimizer,
-            gradient_clip_val=gradient_clip_val,
-            gradient_clip_algorithm=gradient_clip_algorithm,
-        )
-
-    def get_current_beta(self) -> float:
-        """Calculate current beta value based on training progress"""
-        if self.trainer is None:
-            return self.init_beta
-            
-        # Get current epoch and total epochs
-        current_epoch = self.trainer.current_epoch
-        max_epochs = self.trainer.max_epochs
-        
-        # Linear warmup from init_beta to final_beta
-        progress = current_epoch / max_epochs
-        beta = self.init_beta + (self.final_beta - self.init_beta) * progress
-        return beta
+        species_ids = torch.cat(all_species_ids, dim=0)
+        return latents, species_ids

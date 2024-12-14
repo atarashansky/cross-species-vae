@@ -21,7 +21,6 @@ class CrossSpeciesDataset(IterableDataset):
         yield_pairwise: bool = False,
         subsample_size: Optional[int] = None,
         subsample_by: Optional[Dict[str, str]] = None,
-        labels: Optional[Dict[str, str]] = None,
     ):
         """
         Initialize dataset.
@@ -52,12 +51,7 @@ class CrossSpeciesDataset(IterableDataset):
         self.num_workers = None
         self.yield_pairwise = yield_pairwise
         self.subsample_size = subsample_size
-        self.subsample_by = subsample_by
-        self.triplets = None
-        self.label_codes_per_species = None
-        if labels is not None:
-            self.label_codes_per_species = {self.species_to_idx[k]: pd.Categorical(self.species_data[k].obs[labels[k]]).codes for k in self.species_names}
-            
+        self.subsample_by = subsample_by 
         
         # Initialize sampling state
         self._init_sampling_state()
@@ -206,87 +200,36 @@ class CrossSpeciesDataset(IterableDataset):
     
     def __len__(self):
         """Return the number of batches per epoch."""
-        if self.triplets is not None:
-            return None
-        
         cells_in_largest = self.n_cells_per_species[self.largest_species]
         batches_for_largest = int(np.ceil(cells_in_largest / self.batch_size))
         len_multiplier = len(self.species_names) * (len(self.species_names) - 1) // 2 if self.yield_pairwise else 1
         return batches_for_largest * len_multiplier
     
     def __iter__(self):
-        """Iterate over species in round-robin fashion or triplets if provided."""
+        """Iterate over species in round-robin fashion."""
         self._initialize_worker_info()
         
-        if self.triplets is not None:
-            # Get all species pairs and shuffle them
-            rng = np.random.RandomState(np.random.randint(1e9))
-            
-            # Create a list of (pair, batch_idx) tuples and shuffle
-            batch_schedule = []
-            for pair, pair_triplets in self.triplets.items():
-                n_triplets = len(pair_triplets['anchor'])
-                n_batches = int(np.ceil(n_triplets / self.batch_size))
-                batch_schedule.extend([(pair, i) for i in range(n_batches)])
-            
-            rng.shuffle(batch_schedule)
-            
-            # Iterate through shuffled schedule
-            for (src_id, dst_id), batch_idx in batch_schedule:
-                pair_triplets = self.triplets[(src_id, dst_id)]
-                n_triplets = len(pair_triplets['anchor'])
-                
-                start_idx = batch_idx * self.batch_size
-                end_idx = min(start_idx + self.batch_size, n_triplets)
-                batch_indices = np.arange(start_idx, end_idx)
-                
-                # Get data for the batch
-                anchor_data = torch.from_numpy(
-                    self.species_data[self.idx_to_species[src_id]].X[pair_triplets['anchor'][batch_indices]].toarray()
-                )
-                positive_data = torch.from_numpy(
-                    self.species_data[self.idx_to_species[dst_id]].X[pair_triplets['positive'][batch_indices]].toarray()
-                )
-                negative_data = torch.from_numpy(
-                    self.species_data[self.idx_to_species[src_id]].X[pair_triplets['negative'][batch_indices]].toarray()
-                )
-                
-                yield BatchData(triplets={
-                    (src_id, dst_id): {
-                        'anchor': anchor_data,
-                        'positive': positive_data,
-                        'negative': negative_data,
-                    },
-                })
-        else:
-            # Regular iteration
-            self._init_sampling_state()
-            while not self._epoch_finished():
-                data = {}
-                label_codes = {}                
-                for species in self.species_names:
-                    self.current_species = species
-                    indices = self._get_batch_indices()
-                    species_idx = self.species_to_idx[species]
-                    data[species_idx] = self._create_batch(indices)
-                    if self.label_codes_per_species is not None:
-                        label_codes[species_idx] = self.label_codes_per_species[species_idx][indices]
-                
-                if len(indices) < self.batch_size:
-                    break
-                        
-                if self.yield_pairwise:
-                    for i in range(len(data)):
-                        for j in range(i + 1, len(data)):
-                            yield BatchData(data={
-                                i: data[i],
-                                j: data[j]
-                            }, labels={
-                                i: label_codes[i],
-                                j: label_codes[j]
-                            } if self.label_codes_per_species is not None else None)
-                else:
-                    yield BatchData(data=data, labels=label_codes if self.label_codes_per_species is not None else None)
+        self._init_sampling_state()
+        while not self._epoch_finished():
+            data = {}
+            for species in self.species_names:
+                self.current_species = species
+                indices = self._get_batch_indices()
+                species_idx = self.species_to_idx[species]
+                data[species_idx] = self._create_batch(indices)
+
+            if len(indices) < self.batch_size:
+                break
+                    
+            if self.yield_pairwise:
+                for i in range(len(data)):
+                    for j in range(i + 1, len(data)):
+                        yield BatchData(data={
+                            i: data[i],
+                            j: data[j]
+                        })
+            else:
+                yield BatchData(data=data)
 
 class CrossSpeciesDataModule(pl.LightningDataModule):
     """PyTorch Lightning data module for cross-species data."""
@@ -301,7 +244,6 @@ class CrossSpeciesDataModule(pl.LightningDataModule):
         yield_pairwise: bool = False,
         subsample_size: Optional[int] = None,
         subsample_by: Optional[Dict[str, str]] = None,
-        labels: Optional[Dict[str, str]] = None,
     ):
         """
         Initialize data module.
@@ -326,7 +268,6 @@ class CrossSpeciesDataModule(pl.LightningDataModule):
         self.yield_pairwise = yield_pairwise
         self.subsample_size = subsample_size
         self.subsample_by = subsample_by
-        self.labels = labels
 
         self.train_dataset = None
         self.val_dataset = None
@@ -397,7 +338,6 @@ class CrossSpeciesDataModule(pl.LightningDataModule):
                 yield_pairwise=self.yield_pairwise,
                 subsample_size=self.subsample_size,
                 subsample_by=self.subsample_by,
-                labels=self.labels,
             )
             
             self.val_dataset = CrossSpeciesDataset(
@@ -407,7 +347,6 @@ class CrossSpeciesDataModule(pl.LightningDataModule):
                 yield_pairwise=self.yield_pairwise,
                 subsample_size=self.subsample_size,
                 subsample_by=self.subsample_by,
-                # labels=self.labels,
             )
 
         if stage == "test" or stage is None:
@@ -418,7 +357,6 @@ class CrossSpeciesDataModule(pl.LightningDataModule):
                 yield_pairwise=self.yield_pairwise,
                 subsample_size=self.subsample_size,
                 subsample_by=self.subsample_by,
-                # labels=self.labels,
             )
         
 
