@@ -33,6 +33,7 @@ class CrossSpeciesVAE(BaseModel):
         gradient_clip_algorithm: str = "norm",
         direct_recon_weight: float = 1.0,
         cross_species_recon_weight: float = 1.0,
+        transformed_recon_weight: float = 1.0,
         transform_weight: float = 0.1,
         homology_score_momentum: float = 0.9,
     ):
@@ -54,6 +55,7 @@ class CrossSpeciesVAE(BaseModel):
         # Store parameters
         self.direct_recon_weight = direct_recon_weight
         self.cross_species_recon_weight = cross_species_recon_weight
+        self.transformed_recon_weight = transformed_recon_weight
         self.transform_weight = transform_weight
         self.homology_score_momentum = homology_score_momentum        
         self.species_vocab_sizes = species_vocab_sizes
@@ -159,6 +161,7 @@ class CrossSpeciesVAE(BaseModel):
         self.log("train_cross_species_recon", loss_dict["cross_species_recon"].detach(), sync_dist=True)
         self.log("train_kl", loss_dict["kl"].detach(), sync_dist=True)
         self.log("train_transform", loss_dict["transform"].detach(), sync_dist=True)
+        self.log("train_transformed_recon", loss_dict["transformed_recon"].detach(), sync_dist=True)
 
         return loss_dict["loss"]
         
@@ -177,6 +180,7 @@ class CrossSpeciesVAE(BaseModel):
             "val_cross_species_recon": loss_dict["cross_species_recon"].detach(),
             "val_kl": loss_dict["kl"].detach(),
             "val_transform": loss_dict["transform"].detach(),
+            "val_transformed_recon": loss_dict["transformed_recon"].detach(),
         })
         
         return loss_dict["loss"]
@@ -360,6 +364,36 @@ class CrossSpeciesVAE(BaseModel):
     
         return self.cross_species_recon_weight * count_loss_nb / counter
     
+    def _compute_transformed_reconstruction_loss(
+        self,
+        outputs: Dict[str, Any],
+    ) -> torch.Tensor:
+    
+        count_loss_nb = torch.tensor(0.0, device=self.device)
+
+        if not self.homology_available or self.transformed_recon_weight == 0.0:
+            return count_loss_nb
+        
+        counter = 0
+        
+        for target_species_id in outputs:
+            reconstructions = outputs[target_species_id]['transformed_reconstructions']
+            inputs = outputs[target_species_id]['transformed_inputs']
+          
+            for dst_species_id, recon in reconstructions.items():
+                if dst_species_id == target_species_id:
+                    continue
+                
+  
+                target_counts = inputs[dst_species_id]
+
+                pred_counts = recon['mean']
+
+                count_loss_nb += F.mse_loss(pred_counts, target_counts)
+                counter += 1
+    
+        return self.transformed_recon_weight * count_loss_nb / counter
+        
     def _compute_kl_loss(
         self,
         outputs: Dict[str, Any],
@@ -389,18 +423,21 @@ class CrossSpeciesVAE(BaseModel):
         direct_recon_loss = self._compute_direct_reconstruction_loss(outputs, batch)
 
         cross_species_recon_loss = self._compute_cross_species_reconstruction_loss(outputs, batch)
+
+        transformed_recon_loss = self._compute_transformed_reconstruction_loss(outputs)
                 
         kl = self._compute_kl_loss(outputs)
 
         transform_loss = self._compute_transform_consistency_loss(outputs, batch)
                 
         beta = self.get_current_beta()
-        total_loss = direct_recon_loss + cross_species_recon_loss + transform_loss + beta * kl
+        total_loss = direct_recon_loss + cross_species_recon_loss + transformed_recon_loss + transform_loss + beta * kl
         
         return {
             "loss": total_loss,
             "direct_recon": direct_recon_loss,
             "cross_species_recon": cross_species_recon_loss,
+            "transformed_recon": transformed_recon_loss,
             "kl": kl,
             "transform": transform_loss,
         }
@@ -445,6 +482,8 @@ class CrossSpeciesVAE(BaseModel):
             # For each source species (A, B, C)            
             reconstructions = {}
             homology_reconstructions = {}
+            transformed_reconstructions = {}
+            transformed_inputs = {}
             encoder_outputs = {}
                         
             source_encoder = self.encoders[str(source_species_id)]
@@ -463,6 +502,8 @@ class CrossSpeciesVAE(BaseModel):
                     target_encoder = self.encoders[str(target_species_id)]
                     transformed_encoded = target_encoder(transformed)
                     encoder_outputs[target_species_id] = transformed_encoded
+
+                    transformed_inputs[target_species_id] = transformed
                                                 
             
             source_decoder = self.decoders[str(source_species_id)]
@@ -474,11 +515,14 @@ class CrossSpeciesVAE(BaseModel):
 
             for target_species_id in self.species_vocab_sizes.keys():
                 homology_reconstructions[target_species_id] = self.decoders[str(target_species_id)](encoder_outputs[source_species_id]['mu'])
+                transformed_reconstructions[target_species_id] = self.decoders[str(target_species_id)](encoder_outputs[target_species_id]['z'])
 
             results[source_species_id] = {
                 'encoder_outputs': encoder_outputs,
                 'reconstructions': reconstructions,
                 'homology_reconstructions': homology_reconstructions,
+                'transformed_reconstructions': transformed_reconstructions,
+                'transformed_inputs': transformed_inputs,
             }
     
 
@@ -545,6 +589,7 @@ class CrossSpeciesVAE(BaseModel):
         
         return latents
 
+    @torch.no_grad()
     def _update_correlation_estimates(self, batch: BatchData, outputs: Dict[str, Any]):
         """Update running sums for gene-gene correlations across species"""
         
@@ -553,7 +598,7 @@ class CrossSpeciesVAE(BaseModel):
             src_data = batch.data[src_species_id]
             # Update source gene sums
             running_sums_src = getattr(self, f'running_sums_src_{src_species_id}')
-            running_sums_src.add_(src_data.sum(dim=0).detach())
+            running_sums_src.add_(src_data.sum(dim=0))
             
             # For each target species
             for j, dst_species_id in enumerate(keys):
@@ -561,7 +606,7 @@ class CrossSpeciesVAE(BaseModel):
                     continue
                     
                 # Get reconstructed expression in target space
-                dst_data = outputs[src_species_id]['homology_reconstructions'][dst_species_id]['mean'].detach()
+                dst_data = outputs[src_species_id]['homology_reconstructions'][dst_species_id]['mean']
                 
                 # Update target gene sums
                 running_sums_dst = getattr(self, f'running_sums_dst_{dst_species_id}')
@@ -571,13 +616,13 @@ class CrossSpeciesVAE(BaseModel):
                 edges = getattr(self, f'edges_{src_species_id}_{dst_species_id}')
                 
                 # Update raw sum of products - compute intermediate result first
-                products = (src_data[:, edges[:, 0]] * dst_data[:, edges[:, 1]]).sum(dim=0).detach()
+                products = (src_data[:, edges[:, 0]] * dst_data[:, edges[:, 1]]).sum(dim=0)
                 running_sum_products = getattr(self, f'running_sum_products_{src_species_id}_{dst_species_id}')
                 running_sum_products.add_(products)
 
                 # Add tracking of squared values - compute intermediate results first
-                src_squares = src_data.pow(2).sum(dim=0).detach()
-                dst_squares = dst_data.pow(2).sum(dim=0).detach()
+                src_squares = src_data.pow(2).sum(dim=0)
+                dst_squares = dst_data.pow(2).sum(dim=0)
                 
                 running_sum_squares_src = getattr(self, f'running_sum_squares_src_{src_species_id}')
                 running_sum_squares_src.add_(src_squares)
