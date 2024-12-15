@@ -2,70 +2,40 @@ from typing import Dict
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
 class GeneImportanceModule(nn.Module):
-    def __init__(
-        self, 
-        n_genes: int, 
-        n_species: int,
-        n_hidden: int = 128, 
-        dropout: float = 0.1,
-        deeply_inject_species: bool = False,        
-    ):
+    def __init__(self, n_genes: int, n_hidden: int = 128, dropout: float = 0.1):
         super().__init__()
         
         self.global_weights = nn.Parameter(torch.ones(n_genes))
-        
-        self.n_species = n_species if deeply_inject_species else 0
-        
-        self.deeply_inject_species = deeply_inject_species
-        # Separate normalization for gene expressions
-        self.gene_norm = nn.LayerNorm(n_genes)
-        
+
         self.dropout = nn.Dropout(dropout)
-        self.context_net_in = nn.Sequential(
-            # First process concatenated input
-            nn.Linear(n_genes + self.n_species, n_hidden),
+        self.context_net = nn.Sequential(
+            nn.LayerNorm(n_genes),
+            nn.Linear(n_genes, n_hidden),
             nn.LayerNorm(n_hidden),
             nn.ReLU(),
-            self.dropout
-        )
-        self.context_net_out = nn.Sequential(
-            nn.Linear(n_hidden + self.n_species, n_genes),
+            self.dropout,
+            nn.Linear(n_hidden, n_genes),
             nn.Sigmoid()
         )
     
-    def forward(self, x: torch.Tensor, species_id: torch.Tensor | int | None = None) -> torch.Tensor:
-        # Normalize only the gene expressions
-
-        
-        if species_id is not None and isinstance(species_id, int):
-            species_id = torch.full((x.shape[0],), species_id, dtype=torch.long, device=x.device)
-        
-        species_one_hot = None
-        if self.deeply_inject_species and species_id is not None:
-            species_one_hot = F.one_hot(species_id, self.n_species)
-        
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         global_weights = torch.sigmoid(self.global_weights)
-
-        x_normed = self.gene_norm(x)
-        
-        # Concatenate normalized gene expressions with categorical inputs
-        context_input = x_normed
-        if species_one_hot is not None:
-            context_input = torch.cat([context_input, species_one_hot], dim=1)
-        
-        context_input = self.context_net_in(context_input)
-
-        if species_one_hot is not None:
-            context_input = torch.cat([context_input, species_one_hot], dim=1)
-        
-        # Apply importance weighting
-        context_weights = self.context_net_out(context_input)
+        context_weights = self.context_net(x)
         importance = global_weights * context_weights
-        
         return x * importance
 
+class FrozenEmbedding(nn.Module):
+    def __init__(self, embedding_weights: torch.Tensor):
+        super().__init__()
+
+        with torch.no_grad():
+            self.linear = nn.Linear(embedding_weights.shape[0], embedding_weights.shape[1], bias=False)
+            self.linear.weight.copy_(embedding_weights.T)
+
+        
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.linear(x)
 
 class Encoder(nn.Module):
     def __init__(
@@ -77,82 +47,44 @@ class Encoder(nn.Module):
         hidden_dims: list,
         n_context_hidden: int = 128,
         dropout_rate: float = 0.1,
-        deeply_inject_species: bool = False,
     ):
         super().__init__()
         
-        self.n_species = n_species if deeply_inject_species else 0
-        self.deeply_inject_species = deeply_inject_species
-        self.gene_importance = GeneImportanceModule(
-            n_genes, 
-            self.n_species, 
-            n_hidden = n_context_hidden,
-            deeply_inject_species = deeply_inject_species,             
-        )        
+        self.gene_importance = GeneImportanceModule(n_genes, n_context_hidden)     
+        self.n_species = n_species
         
         # Get input dimension for encoder layers
-        self.encoder = self._make_encoder_layers(n_genes, hidden_dims, dropout_rate)
+        self.encoder = self._make_encoder_layers(n_genes + n_species, hidden_dims, dropout_rate)
         self.mu = mu_layer
         self.logvar = logvar_layer
 
-    def _make_encoder_layers(self, input_dim: int, hidden_dims: list, dropout_rate: float) -> nn.ModuleList:
-        layers = nn.ModuleList()
+    @staticmethod
+    def _make_encoder_layers(input_dim: int, hidden_dims: list, dropout_rate: float) -> nn.Sequential:
+        layers = []
         
         dims = [input_dim] + hidden_dims
         for i in range(len(dims) - 1):
-            # Each layer block now takes species information into account
-            layer_block = nn.ModuleDict({
-                'linear': nn.Linear(dims[i] + self.n_species, dims[i + 1]),
-                'norm': nn.LayerNorm(dims[i + 1]),
-                'relu': nn.ReLU(),
-                'dropout': nn.Dropout(dropout_rate)
-            })
-            layers.append(layer_block)
-        return layers
+            layers.extend([
+                nn.Linear(dims[i], dims[i + 1]),
+                nn.LayerNorm(dims[i + 1]),
+                nn.ReLU(),
+                nn.Dropout(dropout_rate)
+            ])
+        return nn.Sequential(*layers)
 
-    def preprocess(self, x: torch.Tensor, species_id: torch.Tensor | int | None = None) -> torch.Tensor:
+    def preprocess(self, x: torch.Tensor) -> torch.Tensor:
         """Apply gene importance weighting"""
-        return x + self.gene_importance(x, species_id)
+        return x + self.gene_importance(x)
     
-    def embed(self, x: torch.Tensor, species_id: torch.Tensor | int | None = None) -> torch.Tensor:
+    def embed(self, x: torch.Tensor) -> torch.Tensor:
         """Transform input to embedding space"""
-        return self.preprocess(x, species_id)
+        return self.preprocess(x)
     
-    def encode(self, embedded: torch.Tensor, species_id: torch.Tensor | int | None = None) -> Dict[str, torch.Tensor]:
+    def encode(self, embedded: torch.Tensor) -> Dict[str, torch.Tensor]:
         """Process embedded input through encoder layers"""
-        # Create one-hot encoding for species
-        if isinstance(species_id, int) and species_id is not None:
-            species_id = torch.full((embedded.shape[0],), species_id, dtype=torch.long, device=embedded.device)
-        
-        species_one_hot = None
-        if self.deeply_inject_species and species_id is not None:
-            species_one_hot = F.one_hot(
-                species_id, 
-                self.n_species
-            )
-        
-        # Process through encoder layers
-        h = embedded
-        for layer_block in self.encoder:
-            # Concatenate species information at each layer
-            if species_one_hot is not None:
-                layer_input = torch.cat([h, species_one_hot], dim=1)
-            else:
-                layer_input = h
-
-            h = layer_block['linear'](layer_input)
-            h = layer_block['norm'](h)
-            h = layer_block['relu'](h)
-            h = layer_block['dropout'](h)
-        
-        # Final concatenation for mu and logvar
-        if species_one_hot is not None:
-            final_h = torch.cat([h, species_one_hot], dim=1)
-        else:
-            final_h = h
-        
-        mu = torch.clamp(self.mu(final_h), min=-20, max=20)
-        logvar = torch.clamp(self.logvar(final_h), min=-20, max=20)
+        h = self.encoder(embedded)
+        mu = torch.clamp(self.mu(h), min=-20, max=20)
+        logvar = torch.clamp(self.logvar(h), min=-20, max=20)
         z = self.reparameterize(mu, logvar)
         return {'mu': mu, 'logvar': logvar, 'z': z}
     
@@ -163,9 +95,15 @@ class Encoder(nn.Module):
         eps = torch.randn_like(std)
         return mu + eps * std if self.training else mu
     
-    def forward(self, x: torch.Tensor, species_id: torch.Tensor | int) -> Dict[str, torch.Tensor]:
-        embedded = self.embed(x, species_id)
-        return self.encode(embedded, species_id)
+    def forward(self, x: torch.Tensor, species_id: torch.Tensor | int | None = None) -> Dict[str, torch.Tensor]:
+        embedded = self.embed(x)
+
+        if species_id is not None and isinstance(species_id, int):
+            species_id = torch.full((x.shape[0],), species_id, dtype=torch.long, device=x.device)
+            species_one_hot = F.one_hot(species_id, self.n_species)
+            embedded = torch.cat([embedded, species_one_hot], dim=-1)
+        
+        return self.encode(embedded)
 
 class Decoder(nn.Module):
     def __init__(
@@ -174,66 +112,42 @@ class Decoder(nn.Module):
         n_species: int,
         n_latent: int,
         hidden_dims: list,
-        deeply_inject_species: bool = False,
         dropout_rate: float = 0.1,
     ):
         super().__init__()
-        
-        self.n_species = n_species if deeply_inject_species else 0
-        self.deeply_inject_species = deeply_inject_species
 
+        self.n_species = n_species
         # Build decoder network
-        def build_decoder_layers(dims: list) -> nn.ModuleList:
-            layers = nn.ModuleList()
+        def build_decoder_layers(dims: list) -> nn.Sequential:
+            layers = []
             
             for i in range(len(dims) - 1):
                 is_last_layer = i == len(dims) - 2
-                
-                layer_block = nn.ModuleDict({
-                    'linear': nn.Linear(dims[i] + self.n_species, dims[i + 1]),
-                    'norm': nn.LayerNorm(dims[i + 1]) if not is_last_layer else nn.Identity(),
-                    'activation': nn.ReLU() if not is_last_layer else nn.Softplus(),
-                    'dropout': nn.Dropout(dropout_rate) if not is_last_layer else nn.Identity()
-                })
-                layers.append(layer_block)
             
-            return layers
+                layers.extend([
+                    nn.Linear(dims[i], dims[i + 1]),
+                    nn.LayerNorm(dims[i + 1]) if not is_last_layer else nn.Identity(),
+                    nn.ReLU() if not is_last_layer else nn.Softplus(),
+                    nn.Dropout(dropout_rate) if not is_last_layer else nn.Identity()
+                ])
+            
+            return nn.Sequential(*layers)
         
-        dims = [n_latent] + hidden_dims + [n_genes]
+        dims = [n_latent + n_species] + hidden_dims + [n_genes]
         
         self.decoder_net = build_decoder_layers(dims)
         self.theta_net = build_decoder_layers(dims)
-    
-    def _process_through_layers(self, z: torch.Tensor, layers: nn.ModuleList, species_id: torch.Tensor | int) -> torch.Tensor:
-        # Create one-hot encoding for species
-        if isinstance(species_id, int) and species_id is not None:
-            species_id = torch.full((z.shape[0],), species_id, dtype=torch.long, device=z.device)
-        
-        species_one_hot = None
-        if self.deeply_inject_species and species_id is not None:
-            species_one_hot = F.one_hot(
-                species_id, 
-                self.n_species
-            )
-        
-        h = z
-        for layer_block in layers:
-            # Concatenate species information at each layer
-            if species_one_hot is not None:
-                layer_input = torch.cat([h, species_one_hot], dim=1)
-            else:
-                layer_input = h
 
-            h = layer_block['linear'](layer_input)
-            h = layer_block['norm'](h)
-            h = layer_block['activation'](h)
-            h = layer_block['dropout'](h)
-        
-        return h
+
     
     def forward(self, z: torch.Tensor, species_id: torch.Tensor | int | None = None) -> Dict[str, torch.Tensor]:
+        if species_id is not None and isinstance(species_id, int):
+            species_id = torch.full((z.shape[0],), species_id, dtype=torch.long, device=z.device)
+            species_one_hot = F.one_hot(species_id, self.n_species)
+            z = torch.cat([z, species_one_hot], dim=-1)
+
         return {
-            'mean': self._process_through_layers(z, self.decoder_net, species_id),
-            'theta': torch.exp(self._process_through_layers(z, self.theta_net, species_id))
+            'mean': self.decoder_net(z),
+            'theta': torch.exp(self.theta_net(z))
         }
     

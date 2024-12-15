@@ -31,10 +31,11 @@ class CrossSpeciesVAE(BaseModel):
         final_beta: float = 1,
         gradient_clip_val: float = 1.0,
         gradient_clip_algorithm: str = "norm",
+        # Loss weights
         direct_recon_weight: float = 1.0,
         cross_species_recon_weight: float = 1.0,
-        transformed_recon_weight: float = 1.0,
-        transform_weight: float = 0.1,
+        cycle_consistency_weight: float = 1.0,
+        # Homology
         homology_score_momentum: float = 0.9,
     ):
         super().__init__(
@@ -51,12 +52,11 @@ class CrossSpeciesVAE(BaseModel):
 
         self.save_hyperparameters(ignore=['homology_edges', 'homology_scores'])
         
-        
-        # Store parameters
+        # Loss weights
         self.direct_recon_weight = direct_recon_weight
         self.cross_species_recon_weight = cross_species_recon_weight
-        self.transformed_recon_weight = transformed_recon_weight
-        self.transform_weight = transform_weight
+        self.cycle_consistency_weight = cycle_consistency_weight
+        
         self.homology_score_momentum = homology_score_momentum        
         self.species_vocab_sizes = species_vocab_sizes
         self.n_species = len(species_vocab_sizes)
@@ -160,9 +160,7 @@ class CrossSpeciesVAE(BaseModel):
         self.log("train_direct_recon", loss_dict["direct_recon"].detach(), sync_dist=True)
         self.log("train_cross_species_recon", loss_dict["cross_species_recon"].detach(), sync_dist=True)
         self.log("train_kl", loss_dict["kl"].detach(), sync_dist=True)
-        self.log("train_transform", loss_dict["transform"].detach(), sync_dist=True)
-        self.log("train_transformed_recon", loss_dict["transformed_recon"].detach(), sync_dist=True)
-
+        self.log("train_cycle_consistency", loss_dict["cycle_consistency"].detach(), sync_dist=True)
         return loss_dict["loss"]
         
     def validation_step(self, batch: BatchData, batch_idx: int):
@@ -179,8 +177,7 @@ class CrossSpeciesVAE(BaseModel):
             "val_direct_recon": loss_dict["direct_recon"].detach(),
             "val_cross_species_recon": loss_dict["cross_species_recon"].detach(),
             "val_kl": loss_dict["kl"].detach(),
-            "val_transform": loss_dict["transform"].detach(),
-            "val_transformed_recon": loss_dict["transformed_recon"].detach(),
+            "val_cycle_consistency": loss_dict["cycle_consistency"].detach(),
         })
         
         return loss_dict["loss"]
@@ -259,43 +256,40 @@ class CrossSpeciesVAE(BaseModel):
             cuda.empty_cache()
 
 
-
-    def _compute_transform_consistency_loss(
+    def _compute_cycle_consistency_loss(
         self,
         outputs: Dict[str, Any],
         batch: BatchData
     ) -> torch.Tensor:
-        transform_loss = torch.tensor(0.0, device=self.device)
-
-        if not self.homology_available or self.transform_weight == 0.0:
-            return transform_loss
+        """Compute cycle consistency loss between original and reconstructed latent representations."""
+        
+        cycle_loss = torch.tensor(0.0, device=self.device)
+        if self.cycle_consistency_weight == 0.0:
+            return cycle_loss
         
         counter = 0
-        
+
         for src_species_id in batch.data:
             # Get original encoding
-            original_encoding = outputs[src_species_id]['encoder_outputs'][src_species_id]
+            original_encoding = outputs[src_species_id]['encoder_outputs'][src_species_id]['mu']
             
             # For each target species (except source)
             for dst_species_id in self.species_vocab_sizes.keys():
                 if dst_species_id == src_species_id:
                     continue
-
-                new_encoding = outputs[src_species_id]['encoder_outputs'][dst_species_id]
+                    
+                # Get reconstruction in target species space
+                reconstructed = outputs[src_species_id]['homology_reconstructions'][dst_species_id]['mean']
                 
-                transform_loss += torch.mean(
-                    0.5 * (
-                        torch.exp(original_encoding['logvar'] - new_encoding['logvar'])  # σ₁²/σ₂²
-                        + (original_encoding['mu'] - new_encoding['mu']).pow(2) / torch.exp(new_encoding['logvar'])  # (μ₁-μ₂)²/σ₂²
-                        - 1  # constant term
-                        + new_encoding['logvar'] - original_encoding['logvar']  # ln(σ₂²/σ₁²)
-                    )
-                )
-
+                # Re-encode the reconstruction using target species encoder
+                reencoded = self.encoders[str(dst_species_id)](reconstructed)['mu']
+                
+                # Compute MSE between original and cycle-generated latents
+                cycle_loss += F.mse_loss(original_encoding, reencoded)
                 counter += 1
-        
-        return self.transform_weight * transform_loss / counter 
-  
+
+        return cycle_loss / counter if counter > 0 else cycle_loss
+
     def _compute_direct_reconstruction_loss(
         self,
         outputs: Dict[str, Any],
@@ -363,37 +357,7 @@ class CrossSpeciesVAE(BaseModel):
                 counter += 1
     
         return self.cross_species_recon_weight * count_loss_nb / counter
-    
-    def _compute_transformed_reconstruction_loss(
-        self,
-        outputs: Dict[str, Any],
-    ) -> torch.Tensor:
-    
-        count_loss_nb = torch.tensor(0.0, device=self.device)
-
-        if not self.homology_available or self.transformed_recon_weight == 0.0:
-            return count_loss_nb
-        
-        counter = 0
-        
-        for target_species_id in outputs:
-            reconstructions = outputs[target_species_id]['transformed_reconstructions']
-            inputs = outputs[target_species_id]['transformed_inputs']
-          
-            for dst_species_id, recon in reconstructions.items():
-                if dst_species_id == target_species_id:
-                    continue
-                
-  
-                target_counts = inputs[dst_species_id]
-
-                pred_counts = recon['mean']
-
-                count_loss_nb += F.mse_loss(pred_counts, target_counts)
-                counter += 1
-    
-        return self.transformed_recon_weight * count_loss_nb / counter
-        
+     
     def _compute_kl_loss(
         self,
         outputs: Dict[str, Any],
@@ -402,19 +366,16 @@ class CrossSpeciesVAE(BaseModel):
         counter = 0
         for target_species_id in outputs:
             # Get encoder outputs for all species
-            encoder_outputs = outputs[target_species_id]['encoder_outputs']
+            encoder_outputs = outputs[target_species_id]['encoder_outputs'][target_species_id]
+            mu = encoder_outputs['mu']
+            logvar = encoder_outputs['logvar']
             
-            # Compute KL for each encoding
-            for _, enc_output in encoder_outputs.items():
-                mu = enc_output['mu']
-                logvar = enc_output['logvar']
-                
-                # Add numerical stability clamps
-                logvar = torch.clamp(logvar, min=-20, max=20)  # Prevent extreme values
-                mu = torch.clamp(mu, min=-20, max=20)  # Prevent extreme values
-                
-                kl += -0.5 * torch.mean(1 + logvar - mu.pow(2) - logvar.exp())
-                counter += 1
+            # Add numerical stability clamps
+            logvar = torch.clamp(logvar, min=-20, max=20)  # Prevent extreme values
+            mu = torch.clamp(mu, min=-20, max=20)  # Prevent extreme values
+            
+            kl += -0.5 * torch.mean(1 + logvar - mu.pow(2) - logvar.exp())
+            counter += 1
                 
         return kl / counter
     
@@ -423,23 +384,20 @@ class CrossSpeciesVAE(BaseModel):
         direct_recon_loss = self._compute_direct_reconstruction_loss(outputs, batch)
 
         cross_species_recon_loss = self._compute_cross_species_reconstruction_loss(outputs, batch)
-
-        transformed_recon_loss = self._compute_transformed_reconstruction_loss(outputs)
                 
-        kl = self._compute_kl_loss(outputs)
+        cycle_consistency_loss = self._compute_cycle_consistency_loss(outputs, batch)
 
-        transform_loss = self._compute_transform_consistency_loss(outputs, batch)
+        kl = self._compute_kl_loss(outputs)
                 
         beta = self.get_current_beta()
-        total_loss = direct_recon_loss + cross_species_recon_loss + transformed_recon_loss + transform_loss + beta * kl
+        total_loss = direct_recon_loss + cross_species_recon_loss + beta * kl + cycle_consistency_loss
         
         return {
             "loss": total_loss,
             "direct_recon": direct_recon_loss,
             "cross_species_recon": cross_species_recon_loss,
-            "transformed_recon": transformed_recon_loss,
             "kl": kl,
-            "transform": transform_loss,
+            "cycle_consistency": cycle_consistency_loss,
         }
     
     @torch.no_grad()
@@ -482,8 +440,6 @@ class CrossSpeciesVAE(BaseModel):
             # For each source species (A, B, C)            
             reconstructions = {}
             homology_reconstructions = {}
-            transformed_reconstructions = {}
-            transformed_inputs = {}
             encoder_outputs = {}
                         
             source_encoder = self.encoders[str(source_species_id)]
@@ -502,8 +458,6 @@ class CrossSpeciesVAE(BaseModel):
                     target_encoder = self.encoders[str(target_species_id)]
                     transformed_encoded = target_encoder(transformed)
                     encoder_outputs[target_species_id] = transformed_encoded
-
-                    transformed_inputs[target_species_id] = transformed
                                                 
             
             source_decoder = self.decoders[str(source_species_id)]
@@ -515,14 +469,11 @@ class CrossSpeciesVAE(BaseModel):
 
             for target_species_id in self.species_vocab_sizes.keys():
                 homology_reconstructions[target_species_id] = self.decoders[str(target_species_id)](encoder_outputs[source_species_id]['mu'])
-                transformed_reconstructions[target_species_id] = self.decoders[str(target_species_id)](encoder_outputs[target_species_id]['z'])
 
             results[source_species_id] = {
                 'encoder_outputs': encoder_outputs,
                 'reconstructions': reconstructions,
                 'homology_reconstructions': homology_reconstructions,
-                'transformed_reconstructions': transformed_reconstructions,
-                'transformed_inputs': transformed_inputs,
             }
     
 
@@ -537,18 +488,13 @@ class CrossSpeciesVAE(BaseModel):
         device: Optional[torch.device] = "cuda",
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         """
-        Get latent embeddings for cells in provided AnnData objects.
+        Get latent embeddings with optional species-based correction.
         
         Args:
             species_data: Dictionary mapping species names to AnnData objects
             return_species: Whether to return species labels
             batch_size: Batch size for processing
-            device: Device to use for computation. If None, uses model's device
-            
-        Returns:
-            If return_species:
-                latents: Tensor of shape [n_cells, n_latent]
-                species: Tensor of shape [n_cells] containing species indices
+            device: Device to use for computation
         """
         if device is None:
             device = next(self.parameters()).device
@@ -560,35 +506,34 @@ class CrossSpeciesVAE(BaseModel):
             batch_size=batch_size,
         )
         
-        # Get full dataset
-        self.eval()  # Set to evaluation mode
-        
+        self.eval()
 
         all_latents = []
         all_species = []
         
+        # Collect latents and calculate species means
         for batch in dataset:
-            # Move batch to device
             batch = BatchData(
                 data={k: v.to(device) for k,v in batch.data.items()},
             )
-            for target_species_id in batch.data:
-                latents = self.encoders[str(target_species_id)](batch.data[target_species_id])['z'].cpu()
+            for species_id in batch.data:
+                latents = self.encoders[str(species_id)](batch.data[species_id])['z'].cpu()
                 all_latents.append(latents)
                 
                 if return_species:
-                    species_idx = torch.full((latents.shape[0],), target_species_id, dtype=torch.long, device=device)
+                    species_idx = torch.full((latents.shape[0],), species_id, dtype=torch.long)
                     all_species.append(species_idx)
-        
-        # Concatenate all batches
+             
+
+        # Concatenate all latents
         latents = torch.cat(all_latents, dim=0)
+        species = torch.cat(all_species, dim=0)
 
         if return_species:
-            species = torch.cat(all_species, dim=0)
             return latents, species
         
         return latents
-
+    
     @torch.no_grad()
     def _update_correlation_estimates(self, batch: BatchData, outputs: Dict[str, Any]):
         """Update running sums for gene-gene correlations across species"""
@@ -632,4 +577,4 @@ class CrossSpeciesVAE(BaseModel):
 
                 # Update count for this specific species pair
                 running_count = getattr(self, f'running_count_{src_species_id}_{dst_species_id}')
-                running_count += batch.data[src_species_id].shape[0]
+                running_count += batch.data[src_species_id].shape[0]    
