@@ -22,21 +22,23 @@ class CrossSpeciesVAE(BaseModel):
         n_latent: int = 256,
         hidden_dims: list = [256],
         dropout_rate: float = 0.2,
+        homology_dropout_rate: float = 0.1,
         base_learning_rate: float = 1e-3,
         base_batch_size: int = 256,
         batch_size: int = 256,
         min_learning_rate: float = 1e-5,
         warmup_data: float = 0.1,
         init_beta: float = 1e-3,
-        final_beta: float = 1,
+        final_beta: float = 0.1,
         gradient_clip_val: float = 1.0,
         gradient_clip_algorithm: str = "norm",
+        
         # Loss weights
         direct_recon_weight: float = 1.0,
         cross_species_recon_weight: float = 1.0,
-        cycle_consistency_weight: float = 1.0,
-        # Homology
-        homology_score_momentum: float = 0.9,
+
+        # Testing parameters
+        use_gene_importance: bool = True,
     ):
         super().__init__(
             base_learning_rate=base_learning_rate,
@@ -55,22 +57,23 @@ class CrossSpeciesVAE(BaseModel):
         # Loss weights
         self.direct_recon_weight = direct_recon_weight
         self.cross_species_recon_weight = cross_species_recon_weight
-        self.cycle_consistency_weight = cycle_consistency_weight
         
-        self.homology_score_momentum = homology_score_momentum        
         self.species_vocab_sizes = species_vocab_sizes
         self.n_species = len(species_vocab_sizes)
         self.n_latent = n_latent
         self.hidden_dims = hidden_dims
         self.dropout_rate = dropout_rate
+        self.homology_dropout_rate = homology_dropout_rate
+
+        self.use_gene_importance = use_gene_importance
         # Initialize model components
         self._init_model_components()
         
         self.homology_available = homology_edges is not None
         if self.homology_available:
-            self._register_homology_buffers(homology_edges, homology_scores)
+            self._init_homology_parameters(homology_edges, homology_scores)
 
-    def _register_homology_buffers(self, homology_edges, homology_scores):        
+    def _init_homology_parameters(self, homology_edges, homology_scores):        
         # Register edges as buffers
         for src_id, species_edges in homology_edges.items():
             for dst_id, edges in species_edges.items():
@@ -79,48 +82,22 @@ class CrossSpeciesVAE(BaseModel):
                     edges if isinstance(edges, torch.Tensor) else torch.tensor(edges)
                 )
         
-        # Initialize and register score buffers
+        # Initialize learnable homology scores for each species pair
         for src_id, species_edges in homology_edges.items():
-            for dst_id, edges in species_edges.items():                    
+            for dst_id, edges in species_edges.items():
+                if dst_id <= src_id:
+                    continue
+
                 init_scores = (
                     torch.ones(len(edges), dtype=torch.float32) if homology_scores is None
                     else homology_scores[src_id][dst_id] / homology_scores[src_id][dst_id].max()
                 )
-                self.register_buffer(f'scores_{src_id}_{dst_id}', init_scores)
-                
-                # Initialize running statistics for each species
-                self.register_buffer(
-                    f'running_sum_products_{src_id}_{dst_id}',
-                    torch.zeros(len(edges), dtype=torch.float32)
+                # Register as parameter instead of buffer for learned homology
+                self.register_parameter(
+                    f'scores_{src_id}_{dst_id}',
+                    nn.Parameter(init_scores)
                 )
-                self.register_buffer(
-                    f'running_sums_src_{src_id}',
-                    torch.zeros(self.species_vocab_sizes[src_id], dtype=torch.float32)
-                )
-                self.register_buffer(
-                    f'running_sums_dst_{dst_id}',
-                    torch.zeros(self.species_vocab_sizes[dst_id], dtype=torch.float32)
-                )
-                self.register_buffer(
-                    f'running_sum_squares_src_{src_id}',
-                    torch.zeros(self.species_vocab_sizes[src_id], dtype=torch.float32)
-                )
-                self.register_buffer(
-                    f'running_sum_squares_dst_{dst_id}',
-                    torch.zeros(self.species_vocab_sizes[dst_id], dtype=torch.float32)
-                )
-        
-        self.register_buffer('running_count', torch.zeros(1))
-
-        # Initialize species-pair specific running counts
-        for src_id in self.species_vocab_sizes.keys():
-            for dst_id in self.species_vocab_sizes.keys():
-                if src_id == dst_id:
-                    continue
-                self.register_buffer(
-                    f'running_count_{src_id}_{dst_id}',
-                    torch.zeros(1)
-                )
+         
 
     def _init_model_components(self):
         self.mu_layer = nn.Linear(self.hidden_dims[-1], self.n_latent)
@@ -129,10 +106,12 @@ class CrossSpeciesVAE(BaseModel):
         self.encoders = nn.ModuleDict({
             str(species_id): Encoder(
                 n_genes=vocab_size,
-                mu_layer=self.mu_layer,
-                logvar_layer=self.logvar_layer,
                 hidden_dims=self.hidden_dims,
+                mu_layer=self.mu_layer,
+                logvar_layer=self.logvar_layer,                
                 dropout_rate=self.dropout_rate,
+                n_latent=self.n_latent,
+                use_gene_importance=self.use_gene_importance,
             )
             for species_id, vocab_size in self.species_vocab_sizes.items()
         })
@@ -153,14 +132,12 @@ class CrossSpeciesVAE(BaseModel):
         
         # Compute losses
         loss_dict = self.compute_loss(batch, outputs)
-        self._update_correlation_estimates(batch, outputs)
         
         # Log metrics
         self.log("train_loss", loss_dict["loss"].detach(), sync_dist=True)
         self.log("train_direct_recon", loss_dict["direct_recon"].detach(), sync_dist=True)
         self.log("train_cross_species_recon", loss_dict["cross_species_recon"].detach(), sync_dist=True)
         self.log("train_kl", loss_dict["kl"].detach(), sync_dist=True)
-        self.log("train_cycle_consistency", loss_dict["cycle_consistency"].detach(), sync_dist=True)
         return loss_dict["loss"]
         
     def validation_step(self, batch: BatchData, batch_idx: int):
@@ -177,7 +154,6 @@ class CrossSpeciesVAE(BaseModel):
             "val_direct_recon": loss_dict["direct_recon"].detach(),
             "val_cross_species_recon": loss_dict["cross_species_recon"].detach(),
             "val_kl": loss_dict["kl"].detach(),
-            "val_cycle_consistency": loss_dict["cycle_consistency"].detach(),
         })
         
         return loss_dict["loss"]
@@ -188,107 +164,7 @@ class CrossSpeciesVAE(BaseModel):
         self.prev_gpu_memory = 0
         if cuda.is_available():
             cuda.empty_cache()
-     
-        # Reset running statistics
-        for src_id in self.species_vocab_sizes.keys():
-            for dst_id in self.species_vocab_sizes.keys():
-                if src_id == dst_id:
-                    continue
-                    
-                getattr(self, f'running_sum_products_{src_id}_{dst_id}').zero_()
-                
-                getattr(self, f'running_sums_src_{src_id}').zero_()
-                getattr(self, f'running_sums_dst_{dst_id}').zero_()
-                
-                getattr(self, f'running_sum_squares_src_{src_id}').zero_()
-                getattr(self, f'running_sum_squares_dst_{dst_id}').zero_()
-                
-                getattr(self, f'running_count_{src_id}_{dst_id}').zero_()
-                getattr(self, f'running_count_{dst_id}_{src_id}').zero_()
-            
-
-    def on_train_epoch_end(self):
-        """Update homology scores based on accumulated correlations"""
-        with torch.no_grad():
-            keys = list(self.species_vocab_sizes.keys())
-            for i, src_species_id in enumerate(keys):
-                for j, dst_species_id in enumerate(keys):
-                    if j <= i:
-                        continue
-                    
-                    running_count = getattr(self, f'running_count_{src_species_id}_{dst_species_id}')
-                    # Get edges for this species pair
-                    edges = getattr(self, f'edges_{src_species_id}_{dst_species_id}')
-                    
-                    # Compute means with epsilon for stability
-                    eps = 1e-8
-                    src_means = getattr(self, f'running_sums_src_{src_species_id}')[edges[:, 0]] / (running_count + eps)
-                    dst_means = getattr(self, f'running_sums_dst_{dst_species_id}')[edges[:, 1]] / (running_count + eps)
-                    
-                    # Get sum of products and compute mean
-                    sum_products = getattr(self, f'running_sum_products_{src_species_id}_{dst_species_id}')
-                    mean_products = sum_products / (running_count + eps)
-                    covariance = mean_products - (src_means * dst_means)                    
-                    
-                    # Compute variances using sum of squares
-                    src_mean_squares = getattr(self, f'running_sum_squares_src_{src_species_id}')[edges[:, 0]] / (running_count + eps)
-                    dst_mean_squares = getattr(self, f'running_sum_squares_dst_{dst_species_id}')[edges[:, 1]] / (running_count + eps)
-                    
-                    # Add epsilon to variances for numerical stability
-                    src_var = (src_mean_squares - src_means.pow(2)).clamp(min=eps)
-                    dst_var = (dst_mean_squares - dst_means.pow(2)).clamp(min=eps)
-                    
-                    # Compute correlation with stable denominator                    
-                    correlations = covariance / torch.sqrt(src_var * dst_var + eps)
-                    new_scores = correlations.clamp(0, 1)  # Ensure valid range
-                    
-                    # Get current scores
-                    scores = getattr(self, f'scores_{src_species_id}_{dst_species_id}')
-
-                    # Apply momentum update
-                    scores.data = self.homology_score_momentum * scores + (1 - self.homology_score_momentum) * new_scores
-
-                    # Update symmetric scores
-                    scores_symmetric = getattr(self, f'scores_{dst_species_id}_{src_species_id}')
-                    scores_symmetric.data = scores.data
-
-        if cuda.is_available():
-            cuda.empty_cache()
-
-
-    def _compute_cycle_consistency_loss(
-        self,
-        outputs: Dict[str, Any],
-        batch: BatchData
-    ) -> torch.Tensor:
-        """Compute cycle consistency loss between original and reconstructed latent representations."""
-        
-        cycle_loss = torch.tensor(0.0, device=self.device)
-        if self.cycle_consistency_weight == 0.0:
-            return cycle_loss
-        
-        counter = 0
-
-        for src_species_id in batch.data:
-            # Get original encoding
-            original_encoding = outputs[src_species_id]['encoder_outputs'][src_species_id]['mu']
-            
-            # For each target species (except source)
-            for dst_species_id in self.species_vocab_sizes.keys():
-                if dst_species_id == src_species_id:
-                    continue
-                    
-                # Get reconstruction in target species space
-                reconstructed = outputs[src_species_id]['homology_reconstructions'][dst_species_id]['mean']
-                
-                # Re-encode the reconstruction using target species encoder
-                reencoded = self.encoders[str(dst_species_id)](reconstructed)['mu']
-                
-                # Compute MSE between original and cycle-generated latents
-                cycle_loss += F.mse_loss(original_encoding, reencoded)
-                counter += 1
-
-        return cycle_loss / counter if counter > 0 else cycle_loss
+   
 
     def _compute_direct_reconstruction_loss(
         self,
@@ -385,22 +261,20 @@ class CrossSpeciesVAE(BaseModel):
 
         cross_species_recon_loss = self._compute_cross_species_reconstruction_loss(outputs, batch)
                 
-        cycle_consistency_loss = self._compute_cycle_consistency_loss(outputs, batch)
 
         kl = self._compute_kl_loss(outputs)
                 
         beta = self.get_current_beta()
-        total_loss = direct_recon_loss + cross_species_recon_loss + beta * kl + cycle_consistency_loss
+        total_loss = direct_recon_loss + cross_species_recon_loss + beta * kl
         
         return {
             "loss": total_loss,
             "direct_recon": direct_recon_loss,
             "cross_species_recon": cross_species_recon_loss,
             "kl": kl,
-            "cycle_consistency": cycle_consistency_loss,
         }
     
-    @torch.no_grad()
+    # @torch.no_grad()
     def _transform_expression(
         self,
         batch: BatchData,
@@ -409,7 +283,12 @@ class CrossSpeciesVAE(BaseModel):
     ) -> torch.Tensor:
         # Create dense transformation matrix
         edges = getattr(self, f'edges_{src_species}_{dst_species}')
-        scores = getattr(self, f'scores_{src_species}_{dst_species}') 
+        src, dst = sorted([src_species, dst_species])
+        scores = getattr(self, f'scores_{src}_{dst}')
+        
+        # Apply dropout during training
+        if self.training:
+            scores = F.dropout(scores, p=self.homology_dropout_rate, training=True)
         
         n_src_genes = self.species_vocab_sizes[src_species]
         n_dst_genes = self.species_vocab_sizes[dst_species]
@@ -437,9 +316,7 @@ class CrossSpeciesVAE(BaseModel):
     def forward(self, batch: BatchData) -> Dict[str, Any]:
         results = {}        
         for source_species_id, source_data in batch.data.items():
-            # For each source species (A, B, C)            
             reconstructions = {}
-            homology_reconstructions = {}
             encoder_outputs = {}
                         
             source_encoder = self.encoders[str(source_species_id)]
@@ -467,13 +344,9 @@ class CrossSpeciesVAE(BaseModel):
                 reconstructions[target_species_id] = source_decoder(encoder_outputs[target_species_id]['z'])
             
 
-            for target_species_id in self.species_vocab_sizes.keys():
-                homology_reconstructions[target_species_id] = self.decoders[str(target_species_id)](encoder_outputs[source_species_id]['mu'])
-
             results[source_species_id] = {
                 'encoder_outputs': encoder_outputs,
                 'reconstructions': reconstructions,
-                'homology_reconstructions': homology_reconstructions,
             }
     
 
@@ -533,48 +406,3 @@ class CrossSpeciesVAE(BaseModel):
             return latents, species
         
         return latents
-    
-    @torch.no_grad()
-    def _update_correlation_estimates(self, batch: BatchData, outputs: Dict[str, Any]):
-        """Update running sums for gene-gene correlations across species"""
-        
-        keys = list(batch.data.keys())
-        for i, src_species_id in enumerate(keys):
-            src_data = batch.data[src_species_id]
-            # Update source gene sums
-            running_sums_src = getattr(self, f'running_sums_src_{src_species_id}')
-            running_sums_src.add_(src_data.sum(dim=0))
-            
-            # For each target species
-            for j, dst_species_id in enumerate(keys):
-                if j <= i:
-                    continue
-                    
-                # Get reconstructed expression in target space
-                dst_data = outputs[src_species_id]['homology_reconstructions'][dst_species_id]['mean']
-                
-                # Update target gene sums
-                running_sums_dst = getattr(self, f'running_sums_dst_{dst_species_id}')
-                running_sums_dst.add_(dst_data.sum(dim=0))
-                
-                # Get edges for this species pair
-                edges = getattr(self, f'edges_{src_species_id}_{dst_species_id}')
-                
-                # Update raw sum of products - compute intermediate result first
-                products = (src_data[:, edges[:, 0]] * dst_data[:, edges[:, 1]]).sum(dim=0)
-                running_sum_products = getattr(self, f'running_sum_products_{src_species_id}_{dst_species_id}')
-                running_sum_products.add_(products)
-
-                # Add tracking of squared values - compute intermediate results first
-                src_squares = src_data.pow(2).sum(dim=0)
-                dst_squares = dst_data.pow(2).sum(dim=0)
-                
-                running_sum_squares_src = getattr(self, f'running_sum_squares_src_{src_species_id}')
-                running_sum_squares_src.add_(src_squares)
-
-                running_sum_squares_dst = getattr(self, f'running_sum_squares_dst_{dst_species_id}')
-                running_sum_squares_dst.add_(dst_squares)
-
-                # Update count for this specific species pair
-                running_count = getattr(self, f'running_count_{src_species_id}_{dst_species_id}')
-                running_count += batch.data[src_species_id].shape[0]    

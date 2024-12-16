@@ -40,12 +40,14 @@ class FrozenEmbedding(nn.Module):
 class Encoder(nn.Module):
     def __init__(
         self,
-        n_genes: int,
-        mu_layer: nn.Linear,
-        logvar_layer: nn.Linear,
+        n_genes: int,   
         hidden_dims: list,
+        mu_layer: nn.Linear | None = None,
+        logvar_layer: nn.Linear | None = None,        
         n_context_hidden: int = 128,
         dropout_rate: float = 0.1,
+        n_latent: int = 128,
+        use_gene_importance: bool = True,   
     ):
         super().__init__()
         
@@ -53,8 +55,17 @@ class Encoder(nn.Module):
         
         # Get input dimension for encoder layers
         self.encoder = self._make_encoder_layers(n_genes, hidden_dims, dropout_rate)
-        self.mu = mu_layer
-        self.logvar = logvar_layer
+        if mu_layer is not None:
+            self.mu = mu_layer
+        else:
+            self.mu = nn.Linear(hidden_dims[-1], n_latent)
+
+        if logvar_layer is not None:
+            self.logvar = logvar_layer
+        else:
+            self.logvar = nn.Linear(hidden_dims[-1], n_latent)
+
+        self.use_gene_importance = use_gene_importance
 
     @staticmethod
     def _make_encoder_layers(input_dim: int, hidden_dims: list, dropout_rate: float) -> nn.Sequential:
@@ -72,7 +83,9 @@ class Encoder(nn.Module):
 
     def preprocess(self, x: torch.Tensor) -> torch.Tensor:
         """Apply gene importance weighting"""
-        return x + self.gene_importance(x)
+        if self.use_gene_importance:
+            return x + self.gene_importance(x)
+        return x
     
     def embed(self, x: torch.Tensor) -> torch.Tensor:
         """Transform input to embedding space"""

@@ -18,6 +18,9 @@ class BaseModel(pl.LightningModule):
     ):
         super().__init__()
 
+        if init_beta > final_beta:
+            init_beta = final_beta
+            
         # Scale learning rate based on batch size
         self.learning_rate = base_learning_rate
         self.init_beta = init_beta
