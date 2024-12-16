@@ -47,7 +47,6 @@ class Encoder(nn.Module):
         n_context_hidden: int = 128,
         dropout_rate: float = 0.1,
         n_latent: int = 128,
-        use_gene_importance: bool = True,   
     ):
         super().__init__()
         
@@ -65,7 +64,6 @@ class Encoder(nn.Module):
         else:
             self.logvar = nn.Linear(hidden_dims[-1], n_latent)
 
-        self.use_gene_importance = use_gene_importance
 
     @staticmethod
     def _make_encoder_layers(input_dim: int, hidden_dims: list, dropout_rate: float) -> nn.Sequential:
@@ -82,10 +80,8 @@ class Encoder(nn.Module):
         return nn.Sequential(*layers)
 
     def preprocess(self, x: torch.Tensor) -> torch.Tensor:
-        """Apply gene importance weighting"""
-        if self.use_gene_importance:
-            return x + self.gene_importance(x)
-        return x
+        """Apply gene importance weighting"""            
+        return x + self.gene_importance(x)
     
     def embed(self, x: torch.Tensor) -> torch.Tensor:
         """Transform input to embedding space"""

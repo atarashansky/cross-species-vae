@@ -22,7 +22,7 @@ class CrossSpeciesVAE(BaseModel):
         n_latent: int = 256,
         hidden_dims: list = [256],
         dropout_rate: float = 0.2,
-        homology_dropout_rate: float = 0.1,
+        homology_dropout_rate: float = 0.2,
         base_learning_rate: float = 1e-3,
         base_batch_size: int = 256,
         batch_size: int = 256,
@@ -36,9 +36,6 @@ class CrossSpeciesVAE(BaseModel):
         # Loss weights
         direct_recon_weight: float = 1.0,
         cross_species_recon_weight: float = 1.0,
-
-        # Testing parameters
-        use_gene_importance: bool = True,
     ):
         super().__init__(
             base_learning_rate=base_learning_rate,
@@ -65,7 +62,6 @@ class CrossSpeciesVAE(BaseModel):
         self.dropout_rate = dropout_rate
         self.homology_dropout_rate = homology_dropout_rate
 
-        self.use_gene_importance = use_gene_importance
         # Initialize model components
         self._init_model_components()
         
@@ -111,7 +107,6 @@ class CrossSpeciesVAE(BaseModel):
                 logvar_layer=self.logvar_layer,                
                 dropout_rate=self.dropout_rate,
                 n_latent=self.n_latent,
-                use_gene_importance=self.use_gene_importance,
             )
             for species_id, vocab_size in self.species_vocab_sizes.items()
         })
