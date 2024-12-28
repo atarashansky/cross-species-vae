@@ -1,7 +1,7 @@
 from typing import Dict
 import torch
 import torch.nn as nn
-
+import torch.nn.functional as F
 class GeneImportanceModule(nn.Module):
     def __init__(self, n_genes: int, n_hidden: int = 128, dropout: float = 0.1):
         super().__init__()
@@ -112,6 +112,7 @@ class Decoder(nn.Module):
         n_genes: int,
         n_latent: int,
         hidden_dims: list,
+        num_clusters: int,
         dropout_rate: float = 0.1,
     ):
         super().__init__()
@@ -133,16 +134,49 @@ class Decoder(nn.Module):
             
             return nn.Sequential(*layers)
         
-        dims = [n_latent] + hidden_dims + [n_genes]
+        dims = [n_latent + num_clusters] + hidden_dims + [n_genes]
         
         self.decoder_net = build_decoder_layers(dims)
         self.theta_net = build_decoder_layers(dims)
 
 
     
-    def forward(self, z: torch.Tensor) -> Dict[str, torch.Tensor]:
+    def forward(self, z: torch.Tensor, memberships: torch.Tensor) -> Dict[str, torch.Tensor]:
+        z_cat = torch.cat([z, memberships], dim=1)
         return {
-            'mean': self.decoder_net(z),
-            'theta': torch.exp(self.theta_net(z))
+            'mean': self.decoder_net(z_cat),
+            'theta': torch.exp(self.theta_net(z_cat))
         }
-    
+
+class ParametricClusterer(nn.Module):
+    def __init__(
+        self, 
+        n_clusters: int, 
+        latent_dim: int,
+        sigma: float = 2.0,
+        min_sigma: float = 0.1,
+        max_sigma: float = 10.0,
+    ):
+        super().__init__()
+        self.centroids = nn.Parameter(torch.randn(n_clusters, latent_dim) * 0.01)
+        self.log_sigma = nn.Parameter(torch.log(torch.tensor(sigma)))
+        self.min_sigma = min_sigma
+        self.max_sigma = max_sigma
+        self.n_clusters = n_clusters
+
+    def forward(self, z: torch.Tensor, log_sigma: torch.Tensor | None = None) -> torch.Tensor:
+        if log_sigma is None:
+            log_sigma = self.log_sigma
+
+        sigma = torch.exp(log_sigma).clamp(min=self.min_sigma, max=self.max_sigma)
+        
+        z_expanded = z.unsqueeze(1)  # (B, 1, D)
+        c_expanded = self.centroids.unsqueeze(0)  # (1, K, D)
+        dist_sq = torch.sum((z_expanded - c_expanded)**2, dim=-1)  # (B, K)
+        
+        membership_logits = -dist_sq / (2 * sigma**2)
+        memberships = F.softmax(membership_logits, dim=1)  # (B, K)
+        
+        return memberships
+
+  

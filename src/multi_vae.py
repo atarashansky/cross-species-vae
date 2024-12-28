@@ -1,5 +1,6 @@
 from typing import Dict, Any, Union, List, Optional, Tuple
 import anndata as ad
+import numpy as np
 import torch
 from torch import cuda
 import torch.nn as nn
@@ -7,7 +8,7 @@ from torch.nn import functional as F
 from src.dataclasses import BatchData
 from src.data import CrossSpeciesInferenceDataset
 from src.utils import negative_binomial_loss
-from src.modules import Encoder, Decoder
+from src.modules import Encoder, Decoder, ParametricClusterer
 from src.base_model import BaseModel
 
 
@@ -36,6 +37,15 @@ class CrossSpeciesVAE(BaseModel):
         # Loss weights
         direct_recon_weight: float = 1.0,
         cross_species_recon_weight: float = 1.0,
+
+        # Parametric Clusterer
+        n_clusters: int = 100,
+        sigma: float = 1.0,
+
+        repulsive_prior_weight: float = 1e-2,
+        repulsive_prior_scale: float = 1.0,
+        cluster_usage_threshold: int = 5,
+
     ):
         super().__init__(
             base_learning_rate=base_learning_rate,
@@ -54,13 +64,19 @@ class CrossSpeciesVAE(BaseModel):
         # Loss weights
         self.direct_recon_weight = direct_recon_weight
         self.cross_species_recon_weight = cross_species_recon_weight
-        
+        self.repulsive_prior_weight = repulsive_prior_weight
+        self.repulsive_prior_scale = repulsive_prior_scale
+        self.cluster_usage_threshold = cluster_usage_threshold
+
+        # Model parameters
         self.species_vocab_sizes = species_vocab_sizes
         self.n_species = len(species_vocab_sizes)
         self.n_latent = n_latent
         self.hidden_dims = hidden_dims
         self.dropout_rate = dropout_rate
         self.homology_dropout_rate = homology_dropout_rate
+        self.n_clusters = n_clusters
+        self.sigma = sigma
 
         # Initialize model components
         self._init_model_components()
@@ -68,6 +84,7 @@ class CrossSpeciesVAE(BaseModel):
         self.homology_available = homology_edges is not None
         if self.homology_available:
             self._init_homology_parameters(homology_edges, homology_scores)
+
 
     def _init_homology_parameters(self, homology_edges, homology_scores):        
         # Register edges as buffers
@@ -116,10 +133,17 @@ class CrossSpeciesVAE(BaseModel):
                 n_genes=vocab_size,
                 n_latent=self.n_latent,
                 hidden_dims=self.hidden_dims[::-1],  # Reverse hidden dims for decoder
+                num_clusters=self.n_clusters,
                 dropout_rate=self.dropout_rate,
             )
             for species_id, vocab_size in self.species_vocab_sizes.items()
         })    
+
+        self.parametric_clusterer = ParametricClusterer(
+            n_clusters=self.n_clusters,
+            latent_dim=self.n_latent,
+            sigma=self.sigma,
+        )        
 
     def training_step(self, batch: BatchData, batch_idx: int):     
         # Forward pass
@@ -133,6 +157,7 @@ class CrossSpeciesVAE(BaseModel):
         self.log("train_direct_recon", loss_dict["direct_recon"].detach(), sync_dist=True)
         self.log("train_cross_species_recon", loss_dict["cross_species_recon"].detach(), sync_dist=True)
         self.log("train_kl", loss_dict["kl"].detach(), sync_dist=True)
+        self.log("train_repulsive_prior", loss_dict["repulsive_prior"].detach(), sync_dist=True)
         return loss_dict["loss"]
         
     def validation_step(self, batch: BatchData, batch_idx: int):
@@ -149,6 +174,7 @@ class CrossSpeciesVAE(BaseModel):
             "val_direct_recon": loss_dict["direct_recon"].detach(),
             "val_cross_species_recon": loss_dict["cross_species_recon"].detach(),
             "val_kl": loss_dict["kl"].detach(),
+            "val_repulsive_prior": loss_dict["repulsive_prior"].detach(),
         })
         
         return loss_dict["loss"]
@@ -160,7 +186,84 @@ class CrossSpeciesVAE(BaseModel):
         if cuda.is_available():
             cuda.empty_cache()
    
+    def on_train_epoch_end(self):
+        super().on_train_epoch_end()
+        
+        all_z = []
+        all_species = []
+        train_dataloader = self.trainer.train_dataloader  # Remove the ()
+        
+        for batch in train_dataloader:  # Access as iterator directly
+            for species_id, data in batch.data.items():
+                with torch.no_grad():
+                    data = data.to(self.device)  # Move data to device first
+                    latents = self.encoders[str(species_id)](data)['z']
+                    all_z.append(latents)
+                    all_species.append(torch.full((latents.shape[0],), species_id, device=self.device))
+                    
+        all_z = torch.cat(all_z, dim=0)
+        all_species = torch.cat(all_species, dim=0)
 
+        memberships = self.parametric_clusterer(all_z).detach().cpu().numpy()
+        cluster_assignments = np.argmax(memberships, axis=1)
+        clusters, counts = np.unique(cluster_assignments, return_counts=True)
+        n_clusters = self.n_clusters
+        clusters = np.arange(n_clusters)
+        counts = np.zeros(n_clusters)
+        counts[clusters] = counts
+
+        underused_mask = counts < self.cluster_usage_threshold
+
+        N = all_z.shape[0]
+        
+        # Indices of underused clusters
+        cluster_indices = np.where(underused_mask)[0]
+        active_centroids = self.parametric_clusterer.centroids[~underused_mask]
+
+        if len(cluster_indices) > 0 and len(active_centroids) > 0:
+            # Calculate distances between all points and active centroids
+            # Using matrix operations for efficiency
+            # ||a-b||^2 = ||a||^2 + ||b||^2 - 2<a,b>
+            point_norm = torch.sum(all_z**2, dim=1, keepdim=True)  # (N, 1)
+            centroid_norm = torch.sum(active_centroids**2, dim=1)  # (K,)
+            dist_matrix = point_norm + centroid_norm - 2 * torch.mm(all_z, active_centroids.t())  # (N, K)
+            
+            # Get minimum distance to any active centroid for each point
+            min_distances = torch.min(dist_matrix, dim=1)[0]  # (N,)
+            
+            # For each underused cluster, pick the point furthest from active centroids
+            for c in cluster_indices:
+                if len(min_distances) > 0:
+                    furthest_idx = torch.argmax(min_distances)
+                    self.parametric_clusterer.centroids.data[c] = all_z[furthest_idx]
+                    # Update min_distances by removing the selected point
+                    min_distances[furthest_idx] = -float('inf')
+
+    def _compute_repulsive_prior(self) -> torch.Tensor:
+        """
+        Repulsive prior: sum_{c < c'} exp(-alpha * ||mu_c - mu_c'||^2)
+        Computed efficiently using matrix operations.
+        """
+        if self.repulsive_prior_weight == 0.0:
+            return torch.tensor(0.0, device=self.device)
+        
+        centroids = self.parametric_clusterer.centroids  # (n_clusters, latent_dim)
+        alpha = self.repulsive_prior_scale
+
+        # Compute pairwise distances using matrix operations
+        # ||a-b||^2 = ||a||^2 + ||b||^2 - 2<a,b>
+        norm_sq = torch.sum(centroids**2, dim=1, keepdim=True)  # (n_clusters, 1)
+        dist_matrix = norm_sq + norm_sq.T - 2 * torch.mm(centroids, centroids.T)
+        
+        # Create mask for upper triangular part (excluding diagonal)
+        mask = torch.triu(torch.ones_like(dist_matrix), diagonal=1)
+        
+        # Compute repulsion sum using masked exponential
+        repulsion_sum = torch.mean(torch.exp(-alpha * dist_matrix) * mask)
+        
+        return self.repulsive_prior_weight * repulsion_sum
+
+ 
     def _compute_direct_reconstruction_loss(
         self,
         outputs: Dict[str, Any],
@@ -258,15 +361,16 @@ class CrossSpeciesVAE(BaseModel):
                 
 
         kl = self._compute_kl_loss(outputs)
-                
+        repulsive_prior = self._compute_repulsive_prior()
         beta = self.get_current_beta()
-        total_loss = direct_recon_loss + cross_species_recon_loss + beta * kl
+        total_loss = direct_recon_loss + cross_species_recon_loss + beta * kl + repulsive_prior
         
         return {
             "loss": total_loss,
             "direct_recon": direct_recon_loss,
             "cross_species_recon": cross_species_recon_loss,
             "kl": kl,
+            "repulsive_prior": repulsive_prior,
         }
     
     # @torch.no_grad()
@@ -313,7 +417,7 @@ class CrossSpeciesVAE(BaseModel):
         for source_species_id, source_data in batch.data.items():
             reconstructions = {}
             encoder_outputs = {}
-                        
+            memberships = {}
             source_encoder = self.encoders[str(source_species_id)]
             source_encoded = source_encoder(source_data)
             encoder_outputs[source_species_id] = source_encoded
@@ -335,17 +439,21 @@ class CrossSpeciesVAE(BaseModel):
             source_decoder = self.decoders[str(source_species_id)]
             # Now decode using concatenated latents for each target space
             for target_species_id in self.species_vocab_sizes.keys():
-                # Decode with target decoder using all latents
-                reconstructions[target_species_id] = source_decoder(encoder_outputs[target_species_id]['z'])
+                encoded = encoder_outputs[target_species_id]['z']
+                membership = self.parametric_clusterer(encoded)
+                reconstructions[target_species_id] = source_decoder(encoded, membership)
+                memberships[target_species_id] = membership
             
 
             results[source_species_id] = {
                 'encoder_outputs': encoder_outputs,
                 'reconstructions': reconstructions,
+                'memberships': memberships,
             }
     
 
         return results
+
 
     @torch.no_grad()
     def get_latent_embeddings(
@@ -385,8 +493,8 @@ class CrossSpeciesVAE(BaseModel):
                 data={k: v.to(device) for k,v in batch.data.items()},
             )
             for species_id in batch.data:
-                latents = self.encoders[str(species_id)](batch.data[species_id])['z'].cpu()
-                all_latents.append(latents)
+                latents = self.encoders[str(species_id)](batch.data[species_id])['z']
+                all_latents.append(latents.cpu())
                 
                 if return_species:
                     species_idx = torch.full((latents.shape[0],), species_id, dtype=torch.long)
@@ -401,3 +509,4 @@ class CrossSpeciesVAE(BaseModel):
             return latents, species
         
         return latents
+   
