@@ -114,6 +114,7 @@ class Decoder(nn.Module):
         n_genes: int,
         n_latent: int,
         hidden_dims: list,
+        n_clusters: int,
         dropout_rate: float = 0.1,
     ):
         super().__init__()
@@ -135,17 +136,18 @@ class Decoder(nn.Module):
             
             return nn.Sequential(*layers)
         
-        dims = [n_latent] + hidden_dims + [n_genes]
+        dims = [n_latent + n_clusters] + hidden_dims + [n_genes]
         
         self.decoder_net = build_decoder_layers(dims)
         self.theta_net = build_decoder_layers(dims)
 
 
     
-    def forward(self, z: torch.Tensor) -> Dict[str, torch.Tensor]:
+    def forward(self, z: torch.Tensor, memberships: torch.Tensor) -> Dict[str, torch.Tensor]:
+        z_cat = torch.cat([z, memberships], dim=-1)
         return {
-            'mean': self.decoder_net(z),
-            'theta': torch.exp(self.theta_net(z))
+            'mean': self.decoder_net(z_cat),
+            'theta': torch.exp(self.theta_net(z_cat))
         }
 
 class ParametricClusterer(nn.Module):
@@ -153,29 +155,45 @@ class ParametricClusterer(nn.Module):
         self, 
         n_clusters: int, 
         latent_dim: int,
-        sigma: float = 2.0,
-        min_sigma: float = 0.1,
-        max_sigma: float = 5.0,
-        wait_epochs: int = 0,
+        initial_sigma: float = 2.0,
+        min_sigma: float = 0.00,
+        max_sigma: float = 20.0,
     ):
         super().__init__()
         self.centroids = nn.Parameter(torch.randn(n_clusters, latent_dim) * 0.01)
-        self.log_sigma = nn.Parameter(torch.log(torch.tensor(sigma)))
+        self.log_sigma = nn.Parameter(torch.log(torch.full((n_clusters,), initial_sigma)))
+        self.initial_sigma = initial_sigma
         self.min_sigma = min_sigma
         self.max_sigma = max_sigma
         self.n_clusters = n_clusters
-        self.current_epoch = 0
-        self.wait_epochs = wait_epochs
+        self.initialized = False
 
-    def forward(self, z: torch.Tensor, log_sigma: torch.Tensor | None = None) -> torch.Tensor:
-        if self.training and self.current_epoch < self.wait_epochs:
-            # Return uniform memberships for the first wait_epochs epochs
-            return torch.ones((z.shape[0], self.n_clusters), device=z.device) / self.n_clusters
+    def initialize_with_kmeans(self, z: torch.Tensor):
+        if self.initialized:
+            return
+            
+        device = z.device
+        self.to(device)
         
-        centroids = self.centroids#.detach()
+        from sklearn.cluster import KMeans
+        z_np = z.detach().cpu().numpy()
+        
+        kmeans = KMeans(n_clusters=self.n_clusters)
+        kmeans.fit(z_np)
 
-        if log_sigma is None:
-            log_sigma = self.log_sigma
+        with torch.no_grad():
+            self.centroids.data = torch.tensor(kmeans.cluster_centers_, device=device, dtype=torch.float32)
+            self.log_sigma.data = torch.log(torch.full((self.n_clusters,), self.initial_sigma, device=device, dtype=torch.float32)) 
+            
+        self.initialized = True
+
+    def forward(self, encoded: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        z = encoded['mu']
+        if self.training and not self.initialized:
+            return {'memberships': torch.ones((z.shape[0], self.n_clusters), device=z.device) / self.n_clusters}
+        
+        centroids = self.centroids
+        log_sigma = self.log_sigma
 
         sigma = torch.exp(log_sigma).clamp(min=self.min_sigma, max=self.max_sigma)
         
@@ -183,10 +201,10 @@ class ParametricClusterer(nn.Module):
         c_expanded = centroids.unsqueeze(0)  # (1, K, D)
         dist_sq = torch.sum((z_expanded - c_expanded)**2, dim=-1)  # (B, K)
         
-        membership_logits = -dist_sq / (2 * sigma**2)
+        membership_logits = -dist_sq / (2 * sigma.unsqueeze(0))
         memberships = F.softmax(membership_logits, dim=1)  # (B, K)
         
-        return memberships
+        return {'memberships': memberships}
 
 class VaDEClusterer(nn.Module):
     def __init__(
@@ -194,12 +212,16 @@ class VaDEClusterer(nn.Module):
         latent_dim: int,
         n_clusters: int,
         initial_sigma: float = 2.0,
+        min_sigma: float = 0.00,
+        max_sigma: float = 20.0,
     ):
         super().__init__()
         
         self.latent_dim = latent_dim
         self.n_clusters = n_clusters
         self.initial_sigma = initial_sigma
+        self.min_sigma = min_sigma
+        self.max_sigma = max_sigma
 
         # GMM parameters
         self.centroids = nn.Parameter(torch.randn(n_clusters, latent_dim))
@@ -207,7 +229,7 @@ class VaDEClusterer(nn.Module):
         self.pi_logits = nn.Parameter(torch.log(torch.ones(n_clusters) / n_clusters))
         self.initialized = False
 
-    def initialize_gmm(self, z: torch.Tensor):
+    def initialize_with_kmeans(self, z: torch.Tensor):
         if self.initialized:
             return
             
@@ -227,6 +249,31 @@ class VaDEClusterer(nn.Module):
         self.initialized = True
         
 
+    def initialize_with_gmm(self, z: torch.Tensor):
+        if self.initialized:
+            return
+            
+        device = z.device
+        self.to(device)
+        
+        from sklearn.mixture import GaussianMixture
+        z_np = z.detach().cpu().numpy()
+        
+        gmm = GaussianMixture(
+            n_components=self.n_clusters,
+            covariance_type='diag',
+            max_iter=100,
+            random_state=42
+        )
+        gmm.fit(z_np)
+
+        with torch.no_grad():
+            self.centroids.data = torch.tensor(gmm.means_, device=device, dtype=torch.float32)
+            self.log_sigma.data = torch.log(torch.tensor(gmm.covariances_, device=device, dtype=torch.float32)) 
+            self.pi_logits.data = torch.log(torch.tensor(gmm.weights_, device=device, dtype=torch.float32))
+            
+        self.initialized = True
+
     def get_gamma(self, z: torch.Tensor):
         pi_tensor = torch.tensor(torch.pi, device=z.device)
         Z = z.unsqueeze(1)
@@ -245,18 +292,16 @@ class VaDEClusterer(nn.Module):
         return gamma
     
     def forward(self, encoded: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
-        z_mean = encoded['mu']
-        z_logvar = encoded['logvar']
-        z = encoded['z']
+        z_mean = encoded['mu'].clamp(min=-20, max=20)
+        z_logvar = encoded['logvar'].clamp(min=-20, max=20)
+        z = encoded['z'].clamp(min=-20, max=20)
 
-        if not self.initialized:
+        if self.training and not self.initialized:
             uniform = torch.ones((z_mean.shape[0], self.n_clusters), device=z_mean.device) / self.n_clusters
             return {"memberships": uniform, "gmm_loss": torch.tensor(0.0, device=z_mean.device)}
         
-        z_logvar = z_logvar.clamp(min=-20, max=2)
-
         pi_tensor = torch.tensor(torch.pi, device=z_mean.device)
-        sigma = torch.exp(self.log_sigma).clamp(min=0)
+        sigma = torch.exp(self.log_sigma).clamp(min=self.min_sigma, max=self.max_sigma)
         gamma = self.get_gamma(z)
 
         logpzc = torch.sum(0.5*gamma*torch.sum(torch.log(2*pi_tensor)+self.log_sigma+torch.exp(z_logvar.unsqueeze(1))/sigma.unsqueeze(0) + (z_mean.unsqueeze(1)-self.centroids.unsqueeze(0)).pow(2)/sigma.unsqueeze(0), dim=-1), dim=-1)

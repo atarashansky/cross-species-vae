@@ -102,7 +102,7 @@ homology_edges, homology_scores = pickle.load(open('homology_zfxe.p','rb'))
 
 
 early_stopping = EarlyStopping(
-    monitor='val_loss',
+    monitor='val_cross_species_recon',
     min_delta=0.001,
     patience=3,
     verbose=True,
@@ -120,10 +120,16 @@ model = CrossSpeciesVAE(
     # Loss weights
     direct_recon_weight=1.0,
     cross_species_recon_weight=1.0,
+    gmm_weight=0e-2,
+    # init_beta=1e-6,
+    # final_beta=1e-3,
     
     # Testing
     n_clusters=100,
-    vade_warmup_epochs=1,
+    clusterer_warmup_epochs=3,
+    initial_sigma=3.0,
+    initialize_with_gmm=True, # when true, initial sigma isn't used fyi
+    use_parametric_clusterer=True,
 
 
     # Learning rate
@@ -155,6 +161,7 @@ trainer = pl.Trainer(
         flush_logs_every_n_steps=10
     )    
 )
+
 
 trainer.fit(model, data_module)
 print(trainer.current_epoch)
