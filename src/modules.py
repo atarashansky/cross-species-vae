@@ -135,7 +135,7 @@ class Decoder(nn.Module):
                 ])
             
             return nn.Sequential(*layers)
-        
+                
         dims = [n_latent + n_clusters] + hidden_dims + [n_genes]
         
         self.decoder_net = build_decoder_layers(dims)
@@ -155,18 +155,20 @@ class ParametricClusterer(nn.Module):
         self, 
         n_clusters: int, 
         latent_dim: int,
-        initial_sigma: float = 2.0,
-        min_sigma: float = 0.00,
-        max_sigma: float = 20.0,
+        initial_sigma: float = 3.0,
+        min_sigma: float = 0.1,
+        max_sigma: float = 10.0,
     ):
         super().__init__()
-        self.centroids = nn.Parameter(torch.randn(n_clusters, latent_dim) * 0.01)
-        self.log_sigma = nn.Parameter(torch.log(torch.full((n_clusters,), initial_sigma)))
+        self.centroids = nn.Parameter(torch.zeros(n_clusters, latent_dim))
+        self.log_sigma = nn.Parameter(torch.zeros(n_clusters, latent_dim))
         self.initial_sigma = initial_sigma
         self.min_sigma = min_sigma
         self.max_sigma = max_sigma
+        self.latent_dim = latent_dim
         self.n_clusters = n_clusters
         self.initialized = False
+
 
     def initialize_with_kmeans(self, z: torch.Tensor):
         if self.initialized:
@@ -183,14 +185,13 @@ class ParametricClusterer(nn.Module):
 
         with torch.no_grad():
             self.centroids.data = torch.tensor(kmeans.cluster_centers_, device=device, dtype=torch.float32)
-            self.log_sigma.data = torch.log(torch.full((self.n_clusters,), self.initial_sigma, device=device, dtype=torch.float32)) 
+            self.log_sigma.data = torch.log(torch.full((self.n_clusters, self.latent_dim), self.initial_sigma, device=device, dtype=torch.float32)) 
             
         self.initialized = True
 
-    def forward(self, encoded: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
-        z = encoded['mu']
-        if self.training and not self.initialized:
-            return {'memberships': torch.ones((z.shape[0], self.n_clusters), device=z.device) / self.n_clusters}
+    def forward(self, z: torch.Tensor) -> torch.Tensor:
+        if not self.initialized:
+            return torch.ones((z.shape[0], self.n_clusters), device=z.device) / self.n_clusters
         
         centroids = self.centroids
         log_sigma = self.log_sigma
@@ -201,10 +202,11 @@ class ParametricClusterer(nn.Module):
         c_expanded = centroids.unsqueeze(0)  # (1, K, D)
         dist_sq = torch.sum((z_expanded - c_expanded)**2, dim=-1)  # (B, K)
         
-        membership_logits = -dist_sq / (2 * sigma.unsqueeze(0))
+        membership_logits = -dist_sq / (2 * sigma)
         memberships = F.softmax(membership_logits, dim=1)  # (B, K)
         
-        return {'memberships': memberships}
+        return memberships
+
 
 class VaDEClusterer(nn.Module):
     def __init__(
@@ -225,7 +227,7 @@ class VaDEClusterer(nn.Module):
 
         # GMM parameters
         self.centroids = nn.Parameter(torch.randn(n_clusters, latent_dim))
-        self.log_sigma = nn.Parameter(torch.zeros(n_clusters))
+        self.log_sigma = nn.Parameter(torch.zeros(n_clusters, latent_dim))
         self.pi_logits = nn.Parameter(torch.log(torch.ones(n_clusters) / n_clusters))
         self.initialized = False
 
@@ -270,7 +272,6 @@ class VaDEClusterer(nn.Module):
         with torch.no_grad():
             self.centroids.data = torch.tensor(gmm.means_, device=device, dtype=torch.float32)
             self.log_sigma.data = torch.log(torch.tensor(gmm.covariances_, device=device, dtype=torch.float32)) 
-            self.pi_logits.data = torch.log(torch.tensor(gmm.weights_, device=device, dtype=torch.float32))
             
         self.initialized = True
 
@@ -296,7 +297,7 @@ class VaDEClusterer(nn.Module):
         z_logvar = encoded['logvar'].clamp(min=-20, max=20)
         z = encoded['z'].clamp(min=-20, max=20)
 
-        if self.training and not self.initialized:
+        if not self.initialized:
             uniform = torch.ones((z_mean.shape[0], self.n_clusters), device=z_mean.device) / self.n_clusters
             return {"memberships": uniform, "gmm_loss": torch.tensor(0.0, device=z_mean.device)}
         
