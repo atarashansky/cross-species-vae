@@ -8,7 +8,7 @@ from torch.nn import functional as F
 from src.dataclasses import BatchData
 from src.data import CrossSpeciesInferenceDataset
 from src.utils import negative_binomial_loss
-from src.modules import Encoder, Decoder, ParametricClusterer
+from src.modules import Encoder, Decoder, ParametricClusterer, VaDEClusterer
 from src.base_model import BaseModel
 
 
@@ -37,15 +37,13 @@ class CrossSpeciesVAE(BaseModel):
         # Loss weights
         direct_recon_weight: float = 1.0,
         cross_species_recon_weight: float = 1.0,
+        gmm_loss_weight: float = 1.0,
 
         # Parametric Clusterer
         n_clusters: int = 100,
-        sigma: float = 1.0,
-
-        repulsive_prior_weight: float = 1e-2,
-        repulsive_prior_scale: float = 1.0,
-        cluster_usage_threshold: int = 5,
-
+        initial_sigma: float = 1.0,
+        cluster_warmup_epochs: int = 3,
+        use_vade: bool = False,
     ):
         super().__init__(
             base_learning_rate=base_learning_rate,
@@ -64,9 +62,8 @@ class CrossSpeciesVAE(BaseModel):
         # Loss weights
         self.direct_recon_weight = direct_recon_weight
         self.cross_species_recon_weight = cross_species_recon_weight
-        self.repulsive_prior_weight = repulsive_prior_weight
-        self.repulsive_prior_scale = repulsive_prior_scale
-        self.cluster_usage_threshold = cluster_usage_threshold
+        self.gmm_loss_weight = gmm_loss_weight
+        self.cluster_warmup_epochs = cluster_warmup_epochs
 
         # Model parameters
         self.species_vocab_sizes = species_vocab_sizes
@@ -76,7 +73,8 @@ class CrossSpeciesVAE(BaseModel):
         self.dropout_rate = dropout_rate
         self.homology_dropout_rate = homology_dropout_rate
         self.n_clusters = n_clusters
-        self.sigma = sigma
+        self.initial_sigma = initial_sigma
+        self.use_vade = use_vade
 
         # Initialize model components
         self._init_model_components()
@@ -139,10 +137,11 @@ class CrossSpeciesVAE(BaseModel):
             for species_id, vocab_size in self.species_vocab_sizes.items()
         })    
 
-        self.parametric_clusterer = ParametricClusterer(
+        clusterer_class = VaDEClusterer if self.use_vade else ParametricClusterer
+        self.clusterer = clusterer_class(
             n_clusters=self.n_clusters,
             latent_dim=self.n_latent,
-            sigma=self.sigma,
+            initial_sigma=self.initial_sigma,
         )        
 
     def training_step(self, batch: BatchData, batch_idx: int):     
@@ -157,7 +156,7 @@ class CrossSpeciesVAE(BaseModel):
         self.log("train_direct_recon", loss_dict["direct_recon"].detach(), sync_dist=True)
         self.log("train_cross_species_recon", loss_dict["cross_species_recon"].detach(), sync_dist=True)
         self.log("train_kl", loss_dict["kl"].detach(), sync_dist=True)
-        self.log("train_repulsive_prior", loss_dict["repulsive_prior"].detach(), sync_dist=True)
+        self.log("train_gmm_loss", loss_dict["gmm_loss"].detach(), sync_dist=True)
         return loss_dict["loss"]
         
     def validation_step(self, batch: BatchData, batch_idx: int):
@@ -174,7 +173,7 @@ class CrossSpeciesVAE(BaseModel):
             "val_direct_recon": loss_dict["direct_recon"].detach(),
             "val_cross_species_recon": loss_dict["cross_species_recon"].detach(),
             "val_kl": loss_dict["kl"].detach(),
-            "val_repulsive_prior": loss_dict["repulsive_prior"].detach(),
+            "val_gmm_loss": loss_dict["gmm_loss"].detach(),
         })
         
         return loss_dict["loss"]
@@ -189,79 +188,19 @@ class CrossSpeciesVAE(BaseModel):
     def on_train_epoch_end(self):
         super().on_train_epoch_end()
         
-        all_z = []
-        all_species = []
-        train_dataloader = self.trainer.train_dataloader  # Remove the ()
-        
-        for batch in train_dataloader:  # Access as iterator directly
-            for species_id, data in batch.data.items():
-                with torch.no_grad():
-                    data = data.to(self.device)  # Move data to device first
-                    latents = self.encoders[str(species_id)](data)['z']
-                    all_z.append(latents)
-                    all_species.append(torch.full((latents.shape[0],), species_id, device=self.device))
-                    
-        all_z = torch.cat(all_z, dim=0)
-        all_species = torch.cat(all_species, dim=0)
-
-        memberships = self.parametric_clusterer(all_z).detach().cpu().numpy()
-        cluster_assignments = np.argmax(memberships, axis=1)
-        clusters, counts = np.unique(cluster_assignments, return_counts=True)
-        n_clusters = self.n_clusters
-        clusters = np.arange(n_clusters)
-        counts = np.zeros(n_clusters)
-        counts[clusters] = counts
-
-        underused_mask = counts < self.cluster_usage_threshold
-
-        N = all_z.shape[0]
-        
-        # Indices of underused clusters
-        cluster_indices = np.where(underused_mask)[0]
-        active_centroids = self.parametric_clusterer.centroids[~underused_mask]
-
-        if len(cluster_indices) > 0 and len(active_centroids) > 0:
-            # Calculate distances between all points and active centroids
-            # Using matrix operations for efficiency
-            # ||a-b||^2 = ||a||^2 + ||b||^2 - 2<a,b>
-            point_norm = torch.sum(all_z**2, dim=1, keepdim=True)  # (N, 1)
-            centroid_norm = torch.sum(active_centroids**2, dim=1)  # (K,)
-            dist_matrix = point_norm + centroid_norm - 2 * torch.mm(all_z, active_centroids.t())  # (N, K)
+        if self.current_epoch == self.cluster_warmup_epochs - 1:
+            all_z = []
+            train_dataloader = self.trainer.train_dataloader
             
-            # Get minimum distance to any active centroid for each point
-            min_distances = torch.min(dist_matrix, dim=1)[0]  # (N,)
-            
-            # For each underused cluster, pick the point furthest from active centroids
-            for c in cluster_indices:
-                if len(min_distances) > 0:
-                    furthest_idx = torch.argmax(min_distances)
-                    self.parametric_clusterer.centroids.data[c] = all_z[furthest_idx]
-                    # Update min_distances by removing the selected point
-                    min_distances[furthest_idx] = -float('inf')
-
-    def _compute_repulsive_prior(self) -> torch.Tensor:
-        """
-        Repulsive prior: sum_{c < c'} exp(-alpha * ||mu_c - mu_c'||^2)
-        Computed efficiently using matrix operations.
-        """
-        if self.repulsive_prior_weight == 0.0:
-            return torch.tensor(0.0, device=self.device)
-        
-        centroids = self.parametric_clusterer.centroids  # (n_clusters, latent_dim)
-        alpha = self.repulsive_prior_scale
-
-        # Compute pairwise distances using matrix operations
-        # ||a-b||^2 = ||a||^2 + ||b||^2 - 2<a,b>
-        norm_sq = torch.sum(centroids**2, dim=1, keepdim=True)  # (n_clusters, 1)
-        dist_matrix = norm_sq + norm_sq.T - 2 * torch.mm(centroids, centroids.T)
-        
-        # Create mask for upper triangular part (excluding diagonal)
-        mask = torch.triu(torch.ones_like(dist_matrix), diagonal=1)
-        
-        # Compute repulsion sum using masked exponential
-        repulsion_sum = torch.mean(torch.exp(-alpha * dist_matrix) * mask)
-        
-        return self.repulsive_prior_weight * repulsion_sum
+            for batch in train_dataloader: 
+                for species_id, data in batch.data.items():
+                    with torch.no_grad():
+                        data = data.to(self.device)
+                        latents = self.encoders[str(species_id)](data)['mu']
+                        all_z.append(latents)
+                        
+            all_z = torch.cat(all_z, dim=0)
+            self.clusterer.initialize_with_kmeans(all_z)
 
  
     def _compute_direct_reconstruction_loss(
@@ -354,23 +293,48 @@ class CrossSpeciesVAE(BaseModel):
         return kl / counter
     
 
+    def _compute_gmm_loss(self, outputs: Dict[str, Any]) -> torch.Tensor:
+        gmm_loss = torch.tensor(0.0, device=self.device)
+        if self.gmm_loss_weight == 0.0:
+            return gmm_loss
+        
+        counter = 0
+        for target_species_id in outputs:
+            gamma = outputs[target_species_id]['memberships'][target_species_id]
+            z_mean = outputs[target_species_id]['encoder_outputs'][target_species_id]['mu'].clamp(min=-20, max=20)
+            z_logvar = outputs[target_species_id]['encoder_outputs'][target_species_id]['logvar'].clamp(min=-20, max=20)
+
+            pi_tensor = torch.tensor(torch.pi, device=z_mean.device)
+            sigma = torch.exp(self.clusterer.log_sigma).clamp(min=self.clusterer.min_sigma, max=self.clusterer.max_sigma)
+
+            logpzc = torch.sum(0.5*gamma*torch.sum(torch.log(2*pi_tensor)+self.clusterer.log_sigma+torch.exp(z_logvar.unsqueeze(1))/sigma.unsqueeze(0) + (z_mean.unsqueeze(1)-self.clusterer.centroids.unsqueeze(0)).pow(2)/sigma.unsqueeze(0), dim=-1), dim=-1)
+            
+            qentropy = -0.5*torch.sum(1+z_logvar+torch.log(2*pi_tensor), 1)
+            logpc = -torch.sum(self.clusterer.pi_logits * gamma, 1)
+            logqcx = torch.sum(torch.log(gamma + 1e-10)*gamma, 1)        
+            gmm_loss += (logpzc + qentropy + logpc + logqcx).mean()
+
+            counter += 1
+
+        return self.gmm_loss_weight * gmm_loss / counter
+
+
     def compute_loss(self, batch: BatchData, outputs: Dict[str, Any]) -> Dict[str, torch.Tensor]:
         direct_recon_loss = self._compute_direct_reconstruction_loss(outputs, batch)
 
         cross_species_recon_loss = self._compute_cross_species_reconstruction_loss(outputs, batch)
-                
+        gmm_loss = self._compute_gmm_loss(outputs)
 
         kl = self._compute_kl_loss(outputs)
-        repulsive_prior = self._compute_repulsive_prior()
         beta = self.get_current_beta()
-        total_loss = direct_recon_loss + cross_species_recon_loss + beta * kl + repulsive_prior
+        total_loss = direct_recon_loss + cross_species_recon_loss + beta * kl + gmm_loss
         
         return {
             "loss": total_loss,
             "direct_recon": direct_recon_loss,
             "cross_species_recon": cross_species_recon_loss,
             "kl": kl,
-            "repulsive_prior": repulsive_prior,
+            "gmm_loss": gmm_loss,
         }
     
     # @torch.no_grad()
@@ -418,6 +382,7 @@ class CrossSpeciesVAE(BaseModel):
             reconstructions = {}
             encoder_outputs = {}
             memberships = {}
+
             source_encoder = self.encoders[str(source_species_id)]
             source_encoded = source_encoder(source_data)
             encoder_outputs[source_species_id] = source_encoded
@@ -439,11 +404,10 @@ class CrossSpeciesVAE(BaseModel):
             source_decoder = self.decoders[str(source_species_id)]
             # Now decode using concatenated latents for each target space
             for target_species_id in self.species_vocab_sizes.keys():
-                encoded = encoder_outputs[target_species_id]['z']
-                membership = self.parametric_clusterer(encoded)
-                reconstructions[target_species_id] = source_decoder(encoded, membership)
+                encoded = encoder_outputs[target_species_id]
+                membership = self.clusterer(encoded['mu'])
+                reconstructions[target_species_id] = source_decoder(encoded['z'], membership)
                 memberships[target_species_id] = membership
-            
 
             results[source_species_id] = {
                 'encoder_outputs': encoder_outputs,
@@ -459,7 +423,6 @@ class CrossSpeciesVAE(BaseModel):
     def get_latent_embeddings(
         self,
         species_data: Dict[str, Union[str, List[str], ad.AnnData, List[ad.AnnData]]],
-        return_species: bool = True,
         batch_size: int = 512,
         device: Optional[torch.device] = "cuda",
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
@@ -493,20 +456,17 @@ class CrossSpeciesVAE(BaseModel):
                 data={k: v.to(device) for k,v in batch.data.items()},
             )
             for species_id in batch.data:
-                latents = self.encoders[str(species_id)](batch.data[species_id])['z']
+                latents = self.encoders[str(species_id)](batch.data[species_id])['mu']
                 all_latents.append(latents.cpu())
                 
-                if return_species:
-                    species_idx = torch.full((latents.shape[0],), species_id, dtype=torch.long)
-                    all_species.append(species_idx)
+                species_idx = torch.full((latents.shape[0],), species_id, dtype=torch.long)
+                all_species.append(species_idx)
              
 
         # Concatenate all latents
         latents = torch.cat(all_latents, dim=0)
         species = torch.cat(all_species, dim=0)
-
-        if return_species:
-            return latents, species
+        memberships = self.clusterer(latents.to(device))
+        return latents, species, memberships
         
-        return latents
    
