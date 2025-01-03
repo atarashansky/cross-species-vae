@@ -8,12 +8,12 @@ import numpy as np
 from glob import glob
 import anndata
 import pandas as pd
-# from src.multi_vae_pemb import CrossSpeciesVAE
+from src.single_vae import VAE
 from src.multi_vae import CrossSpeciesVAE
 from src.callbacks import StageAwareEarlyStopping
 from src.data import CrossSpeciesDataModule
 import pickle
-from sklearn.metrics import adjusted_mutual_info_score
+from sklearn.metrics import adjusted_mutual_info_score, adjusted_rand_score
 import scanpy as sc
 import matplotlib.pyplot as plt
 import umap
@@ -80,79 +80,13 @@ def find_nearest_neighbors(L1, L2, n_neighbors=15, metric='correlation'):
     
     return indices, distances
 
-adata1 = anndata.read_h5ad('data/wagner/data.h5ad')
-adata2 = anndata.read_h5ad('data/briggs/data.h5ad')
 
-adata1.X = adata1.X.astype('float32')
-adata2.X = adata2.X.astype('float32')
+species_data_sub = pickle.load(open('data.p','rb'))
 
-emb1 = pickle.load(open('data/wagner/gene_embeddings.pkl','rb'))
-emb2 = pickle.load(open('data/briggs/gene_embeddings.pkl','rb'))
+adata1 = species_data_sub['fish']
+adata2 = species_data_sub['frog']
 
-emb1 = torch.cat([torch.tensor(emb1[i]).unsqueeze(-2) for i in adata1.var_names],dim=0).float()
-emb2 = torch.cat([torch.tensor(emb2[i]).unsqueeze(-2) for i in adata2.var_names],dim=0).float()
-
-XY_raw = _united_proj(emb1.numpy(), emb2.numpy(), k=25, metric='euclidean')
-YX_raw = _united_proj(emb2.numpy(), emb1.numpy(), k=25, metric='euclidean')
-
-XY = XY_raw.copy()
-YX = YX_raw.copy()
-XY.data[:]=1
-YX.data[:]=1
-
-G = XY + YX.T
-
-G.data[G.data>1]=0
-G.eliminate_zeros()
-x, y = G.nonzero()
-
-
-G = XY_raw/2 + YX_raw.T/2
-G[x,y] = 0
-G.eliminate_zeros()
-x, y = G.nonzero()
-
-homology_edges = {}
-homology_edges[0] = {}
-homology_edges[0][1] = torch.tensor(np.vstack((x,y)).T)
-
-homology_edges[1] = {}
-homology_edges[1][0] = torch.tensor(np.vstack((y,x)).T)
-
-homology_scores = {}
-homology_scores[0] = {}
-homology_scores[0][1] = torch.tensor(G.data).float()
-
-homology_scores[1] = {}
-homology_scores[1][0] = torch.tensor(G.data).float()
-
-species_data = {
-    "wagner": adata1,
-    "briggs": adata2,
-}
-
-emb_data = {
-    "wagner": emb1,
-    "briggs": emb2, 
-}
-data_module = CrossSpeciesDataModule(
-    species_data = species_data,
-    batch_size=512,
-    num_workers=0,
-    val_split=0.001,
-    test_split=0.001,
-    yield_pairwise=False,
-    subsample_size=10000,
-    subsample_by={
-        "wagner": "cell_type",
-        "briggs": "cell_type",   
-    }
-)
-data_module.setup()
-
-species_data_sub = {k: data_module.train_dataset.epoch_data[k][data_module.train_dataset.epoch_indices[k]].copy() for k in data_module.train_dataset.epoch_data}
-
-batch_size = 512
+batch_size = 256
 
 data_module = CrossSpeciesDataModule(
     species_data = species_data_sub,
@@ -161,56 +95,60 @@ data_module = CrossSpeciesDataModule(
     val_split=0.1,
     test_split=0.1,
     yield_pairwise=False,
-    labels={
-        "wagner": "cell_type",
-        "briggs": "cell_type",
-    }
 )
 data_module.setup()
 
-emb_data = {data_module.train_dataset.species_to_idx[k]: v for k,v in emb_data.items()}
-
 species_vocab_sizes = data_module.species_vocab_sizes
+homology_edges, homology_scores = pickle.load(open('homology_zfxe.p','rb'))
 
-# Initialize the model using data module properties
+early_stopping = EarlyStopping(
+    monitor='val_loss',
+    min_delta=0.001,
+    patience=3,
+    verbose=True,
+    mode='min'
+)
+
+
 model = CrossSpeciesVAE(
     species_vocab_sizes=species_vocab_sizes,
     homology_edges=homology_edges,
     homology_scores=homology_scores,
     batch_size=batch_size,
+    
+    # Loss weights
     direct_recon_weight=1.0,
     cross_species_recon_weight=1.0,
+    membership_entropy_weight=1.0,
+    
+    # Testing
+    n_clusters=100,
+    cluster_warmup_epochs=3,
+    initial_sigma=2,
+    initial_alpha = 0.5,    
 
-    triplet_epoch_start=0.5,
-    triplet_loss_margin=0.2,
-    
-    transform_weight=0.0, #from 0.1
-    base_learning_rate=1e-2,
-    min_learning_rate=1e-4,
-    
+    # Learning rate
+    base_learning_rate=5e-3,
+    min_learning_rate=5e-5,    
     warmup_data=0.1,
-    homology_score_momentum=0.9,
-)
+    
+    # Homology dropout
+    homology_dropout_rate=0.2,
+    
 
-early_stopping = EarlyStopping(
-    monitor='val_loss',
-    min_delta=0.0,
-    patience=11,
-    verbose=True,
-    mode='min'
 )
 
 # Initialize the trainer
 trainer = pl.Trainer(
     accelerator="gpu",
     devices=1,
-    max_epochs=4,
+    max_epochs=30,
     precision='16-mixed',
     gradient_clip_val=model.gradient_clip_val,
     gradient_clip_algorithm="norm",
     log_every_n_steps=1,
     deterministic=True,
-    callbacks=[],
+    callbacks=[early_stopping],
     accumulate_grad_batches=1,
     enable_progress_bar=True,
     fast_dev_run=False,
@@ -220,6 +158,7 @@ trainer = pl.Trainer(
         flush_logs_every_n_steps=10
     )    
 )
+
 
 trainer.fit(model, data_module)
 print(trainer.current_epoch)
