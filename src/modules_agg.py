@@ -27,44 +27,109 @@ class GeneImportanceModule(nn.Module):
         importance = global_weights * context_weights
         return x * importance
 
-class FrozenEmbedding(nn.Module):
-    def __init__(self, embedding_weights: torch.Tensor):
+
+class ESMGeneAggregator(nn.Module):
+    """
+    A learnable aggregator that transforms a cell's gene-expression values x
+    into an aggregated embedding v, using each gene's ESM embedding.
+    
+    Args:
+        n_genes (int): Number of genes for the species.
+        embed_dim (int): Dimensionality of each gene's ESM embedding.
+        aggregator_hidden_dim (int): Hidden dimension for the aggregator MLP.
+        aggregator_output_dim (int): Final dimension of the aggregated vector v.
+        dropout (float): Dropout probability in the aggregator MLP.
+        init_embeddings (torch.Tensor, optional): 
+            Pre-computed ESM embeddings of shape (n_genes, embed_dim). 
+            If None, will initialize randomly (not recommended for real usage).
+    """
+    def __init__(
+        self,
+        n_genes: int,
+        gene_embeddings: torch.Tensor,
+        aggregator_hidden_dim: int = 128,
+        aggregator_output_dim: int = 128,
+        dropout: float = 0.1,
+    ):
         super().__init__()
+        
+        # TODO: Consider freezing this
+        self.register_buffer('gene_embeddings', gene_embeddings)
+        embed_dim = gene_embeddings.shape[-1]
 
-        with torch.no_grad():
-            self.linear = nn.Linear(embedding_weights.shape[0], embedding_weights.shape[1], bias=False)
-            self.linear.weight.copy_(embedding_weights.T)
-
+        self.gene_importance = GeneImportanceModule(n_genes)        
+        
+        # Simple MLP for per-gene transform
+        self.aggregator = nn.Sequential(
+            nn.LayerNorm(embed_dim),
+            nn.Linear(embed_dim, aggregator_hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(aggregator_hidden_dim, aggregator_output_dim),
+            nn.ReLU()
+        )
         
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.linear(x)
+        """
+        Forward pass.
+        
+        Args:
+            x (torch.Tensor): A batch of gene-expression counts or normalized values
+                with shape (batch_size, n_genes).
+
+        Returns:
+            torch.Tensor: The aggregated embedding vector v for each cell,
+                shape (batch_size, aggregator_output_dim).
+        """
+        # x shape: (B, n_genes)
+        B = x.shape[0]
+        n_genes, embed_dim = self.gene_embeddings.shape
+        
+        # Broadcast the gene embedding matrix so it matches batch size
+        # shape: (B, n_genes, embed_dim)
+        expanded_embeddings = self.gene_embeddings.unsqueeze(0).expand(B, -1, -1)
+        
+        x = self.gene_importance(x)
+
+        # Reshape x to (B, n_genes, 1) so we can multiply each gene's expression by its embedding
+        x_expanded = x.unsqueeze(-1)  # (B, n_genes, 1)
+        
+        # Weighted gene embeddings: (B, n_genes, embed_dim)
+        weighted_embeddings = x_expanded * expanded_embeddings
+        
+        # Flatten so MLP processes each gene's embedding separately:
+        # shape => (B * n_genes, embed_dim)
+        flattened = weighted_embeddings.reshape(-1, embed_dim)
+        
+        # Pass each gene embedding through the aggregator MLP
+        # shape => (B * n_genes, aggregator_output_dim)
+        
+        transformed = self.aggregator(flattened)
+        
+        # Reshape back to (B, n_genes, aggregator_output_dim)
+        transformed = transformed.reshape(B, n_genes, -1)
+        
+        # Sum (or average) over the gene dimension => (B, aggregator_output_dim)
+        v = transformed.mean(dim=1)
+        # If you prefer to average, you can do:
+        # v = transformed.mean(dim=1)
+        
+        return v
+
 
 class Encoder(nn.Module):
     def __init__(
         self,
-        n_genes: int,   
-        hidden_dims: list,
-        mu_layer: nn.Linear | None = None,
-        logvar_layer: nn.Linear | None = None,        
-        n_context_hidden: int = 128,
+        input_dim: int,   
+        hidden_dims: list,     
         dropout_rate: float = 0.1,
         n_latent: int = 128,
     ):
         super().__init__()
         
-        self.gene_importance = GeneImportanceModule(n_genes, n_context_hidden)        
-        
-        # Get input dimension for encoder layers
-        self.encoder = self._make_encoder_layers(n_genes, hidden_dims, dropout_rate)
-        if mu_layer is not None:
-            self.mu = mu_layer
-        else:
-            self.mu = nn.Linear(hidden_dims[-1], n_latent)
-
-        if logvar_layer is not None:
-            self.logvar = logvar_layer
-        else:
-            self.logvar = nn.Linear(hidden_dims[-1], n_latent)
+        self.encoder = self._make_encoder_layers(input_dim, hidden_dims, dropout_rate)
+        self.mu = nn.Linear(hidden_dims[-1], n_latent)
+        self.logvar = nn.Linear(hidden_dims[-1], n_latent)
 
 
     @staticmethod
@@ -81,13 +146,6 @@ class Encoder(nn.Module):
             ])
         return nn.Sequential(*layers)
 
-    def preprocess(self, x: torch.Tensor) -> torch.Tensor:
-        """Apply gene importance weighting"""            
-        return x + self.gene_importance(x)
-    
-    def embed(self, x: torch.Tensor) -> torch.Tensor:
-        """Transform input to embedding space"""
-        return self.preprocess(x)
     
     def encode(self, embedded: torch.Tensor) -> Dict[str, torch.Tensor]:
         """Process embedded input through encoder layers"""
@@ -105,8 +163,7 @@ class Encoder(nn.Module):
         return mu + eps * std
     
     def forward(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
-        embedded = self.embed(x)
-        return self.encode(embedded)
+        return self.encode(x)
     
     
 class Decoder(nn.Module):
